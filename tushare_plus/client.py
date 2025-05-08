@@ -113,8 +113,15 @@ class APILimitDetector:
             logger.error(f"保存API限制参数失败: {str(e)}")
 
 class TushareAPI:
-    def __init__(self, token, max_workers=5, max_retries=3, retry_delay=1, enable_rate_limit=True):
-        self.token = token
+    def __init__(self, token=None, max_workers=5, max_retries=3, retry_delay=1, enable_rate_limit=True):
+        if token:
+            self.token = token
+        else:
+            self.token = os.environ.get('TUSHARE_TOKEN')
+
+        if not self.token:
+            raise ValueError("Tushare token must be provided either as an argument or via TUSHARE_TOKEN environment variable.")
+
         self.api_url = "http://api.tushare.pro"
         self.max_workers = max_workers
         self.max_retries = max_retries

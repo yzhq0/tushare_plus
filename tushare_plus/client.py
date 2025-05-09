@@ -203,7 +203,7 @@ class TushareAPI:
                     if not has_more:
                         # has_more为False，说明这是所有数据，没有单次请求限制
                         logger.info(f"接口 {api_name} 可能没有单次请求限制，返回数据量为 {count} 条")
-                        return float('inf')
+                        return 0  # 使用0表示没有限制，而不是float('inf')
                     else:
                         # has_more为True，说明有更多数据，当前返回量可能是单次限制
                         logger.info(f"接口 {api_name} 的单次请求限制为 {count} 条")
@@ -216,7 +216,7 @@ class TushareAPI:
                     else:
                         # 如果不是1000的整数倍，认为没有限制
                         logger.info(f"接口 {api_name} 可能没有单次请求限制，返回数据量为 {count} 条")
-                        return float('inf')  # 使用无穷大表示没有限制
+                        return 0  # 使用0表示没有限制，而不是float('inf')
         except Exception as e:
             logger.warning(f"探测接口 {api_name} 的单次请求限制失败: {str(e)}")
             # 失败时使用默认值
@@ -285,17 +285,19 @@ class TushareAPI:
         if api_name in self._api_info_cache:
             return self._api_info_cache[api_name]
             
-        # 如果禁用了频率限制，使用较大的默认值
+        # 如果禁用了频率限制，使用0表示无限制
         if not self.enable_rate_limit:
             # 只探测单次请求限制，不探测频率限制
             cached_limits = self.limit_detector.get_api_limits(api_name)
             if cached_limits is None:
                 # 没有缓存，只探测单次请求限制
                 limit_per_request = self._detect_request_limit(api_name, self._api_required_params.get(api_name, {}))
-                rate_limit = 10000  # 使用一个很大的值表示没有频率限制
+                rate_limit = 0  # 使用0表示没有频率限制
+                # 保存探测结果到CSV文件
+                self.limit_detector.save_api_limits(api_name, limit_per_request, rate_limit)
             else:
-                limit_per_request = int(cached_limits["limit_per_request"]) if cached_limits["limit_per_request"] != float('inf') else float('inf')
-                rate_limit = 10000  # 使用一个很大的值表示没有频率限制
+                limit_per_request = int(cached_limits["limit_per_request"]) if cached_limits["limit_per_request"] != 0 else 0
+                rate_limit = 0  # 使用0表示没有频率限制
         else:
             # 尝试从CSV文件获取缓存的限制参数
             cached_limits = self.limit_detector.get_api_limits(api_name)
@@ -305,7 +307,7 @@ class TushareAPI:
                 limit_per_request, rate_limit = self._detect_api_limits(api_name)
             else:
                 # 确保是Python原生类型
-                limit_per_request = int(cached_limits["limit_per_request"]) if cached_limits["limit_per_request"] != float('inf') else float('inf')
+                limit_per_request = int(cached_limits["limit_per_request"])
                 rate_limit = int(cached_limits["rate_limit"])
         
         # 保存到缓存
@@ -375,6 +377,10 @@ class TushareAPI:
         api_info = self._api_info_cache.get(api_name, {"rate_limit": 60})
         rate_limit = api_info.get('rate_limit', 60)  # 默认每分钟 60 次
         
+        # 如果rate_limit为0，表示没有频率限制，直接返回
+        if rate_limit == 0:
+            return
+        
         # 初始化该 API 的访问历史记录
         if not hasattr(self, '_api_call_history'):
             self._api_call_history = {}
@@ -428,8 +434,8 @@ class TushareAPI:
         api_info = self.get_api_info(api_name)
         limit_per_request = api_info.get('limit_per_request', 5000)
         
-        # 如果接口没有单次查询上限，直接请求
-        if limit_per_request == float('inf'):
+        # 如果接口没有单次查询上限（值为0），直接请求
+        if limit_per_request == 0:
             data = self._make_request(api_name, params, fields)
             return pd.DataFrame(data["items"], columns=data["fields"])
         

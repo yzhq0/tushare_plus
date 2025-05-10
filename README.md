@@ -85,7 +85,6 @@ client = TushareAPI(token="your_token_here", max_retries=5, retry_delay=2)
 当前版本存在以下已知问题，将在后续版本中改进：
 
 1. 错误代码处理不完善，当前实现的错误代码与Tushare实际的错误代码可能不一致
-2. 频率限制中错误信息的特征判断不准确，需要根据实际使用情况进行调整
 
 ## 许可证
 

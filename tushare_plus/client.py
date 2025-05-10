@@ -113,7 +113,17 @@ class APILimitDetector:
             logger.error(f"保存API限制参数失败: {str(e)}")
 
 class TushareAPI:
-    def __init__(self, token=None, max_workers=5, max_retries=3, retry_delay=1, enable_rate_limit=True):
+
+    def __init__(
+        self,
+        token=None,
+        max_workers=5,
+        max_retries=3,
+        retry_delay=1,
+        enable_rate_limit=True,
+        custom_params_file=None,
+        api_limits_file="api_limits.csv"
+    ):
         if token:
             self.token = token
         else:
@@ -126,17 +136,61 @@ class TushareAPI:
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.limit_detector = APILimitDetector()  # 使用默认的相对路径
+        self.limit_detector = APILimitDetector(api_limits_file)  # 使用传入的文件路径
         self._api_last_call_time = {}
         self._api_info_cache = {}  # 添加缓存初始化
         self.enable_rate_limit = enable_rate_limit  # 添加频率限制开关
-        # 添加接口必要参数的映射
-        self._api_required_params = {
-            # 某些接口需要特定参数才能正常探测限制
-            "index_weight": {"index_code": "000906.SH"},  # 中证800指数成分权重
-            # 其他接口的必要参数可根据需要添加
+
+        # 加载API参数配置
+        self._api_required_params = self._load_api_params(custom_params_file)
+
+    def _load_api_params(self, custom_params_file=None):
+        """加载API参数配置
+        
+        参数:
+            custom_params_file: 自定义参数配置文件路径，如果为None则使用默认配置
+        
+        返回:
+            API参数配置字典
+        """
+        # 默认参数配置
+        default_params = {
+            "index_weight": {"index_code": "000906.SH"}  # 基本配置，作为备用
         }
-    
+
+        # 尝试加载默认配置文件
+        default_params_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'api_params.json')
+        if os.path.exists(default_params_file):
+            try:
+                with open(default_params_file, 'r', encoding='utf-8') as f:
+                    default_params = json.load(f)
+                    logger.info(f"已加载默认API参数配置: {default_params_file}")
+            except Exception as e:
+                logger.warning(f"加载默认API参数配置失败: {str(e)}")
+
+        # 如果提供了自定义配置文件，合并配置
+        if custom_params_file and os.path.exists(custom_params_file):
+            try:
+                with open(custom_params_file, 'r', encoding='utf-8') as f:
+                    custom_params = json.load(f)
+                    # 合并配置，自定义配置优先
+                    default_params.update(custom_params)
+                    logger.info(f"已加载自定义API参数配置: {custom_params_file}")
+            except Exception as e:
+                logger.warning(f"加载自定义API参数配置失败: {str(e)}")
+
+        return default_params
+
+    def add_api_params(self, api_name, params):
+        """添加或更新API参数
+        
+        参数:
+            api_name: API接口名称
+            params: 参数字典
+        """
+        self._api_required_params[api_name] = params
+        logger.info(f"已添加API参数: {api_name} = {params}")
+
     def _detect_api_limits(self, api_name: str) -> Tuple[int, int]:
         """探测API的限制参数
         
@@ -144,22 +198,22 @@ class TushareAPI:
             api_name: API接口名称
         """
         logger.info(f"开始探测接口 {api_name} 的限制参数...")
-        
+
         # 使用预定义的必要参数，不合并用户传入的参数
         required_params = self._api_required_params.get(api_name, {}).copy()
-        
+
         # 首先探测单次请求限制
         limit = self._detect_request_limit(api_name, required_params)
-        
+
         # 然后探测访问频率限制
         rate_limit = self._detect_rate_limit(api_name, required_params)
-        
+
         # 保存探测结果
         self.limit_detector.save_api_limits(api_name, limit, rate_limit)
         logger.info(f"接口 {api_name} 的限制参数探测完成：单次限制 {limit}，频率限制 {rate_limit}/分钟")
-        
+
         return limit, rate_limit
-    
+
     def _detect_request_limit(self, api_name: str, required_params: Dict = None) -> int:
         """探测单次请求数据量限制
         
@@ -169,12 +223,12 @@ class TushareAPI:
         """
         if required_params is None:
             required_params = {}
-            
+
         try:
             logger.info(f"开始探测接口 {api_name} 的单次请求限制...")
             # 构造请求参数，包含必要参数
             params = required_params.copy()
-            
+
             # 不设置limit参数，直接请求
             payload = {
                 "api_name": api_name,
@@ -194,10 +248,10 @@ class TushareAPI:
                     raise Exception(f"Error {result['code']}: {result['msg']}")
                 data = result["data"]
                 count = len(data["items"])
-                
+
                 # 检查是否有has_more字段
                 has_more = data.get("has_more", None)
-                
+
                 if has_more is not None:
                     # 如果API返回了has_more字段
                     if not has_more:
@@ -221,7 +275,7 @@ class TushareAPI:
             logger.warning(f"探测接口 {api_name} 的单次请求限制失败: {str(e)}")
             # 失败时使用默认值
             return 5000
-    
+
     def _detect_rate_limit(self, api_name: str, required_params: Dict = None) -> int:
         """探测每分钟访问频率限制
         
@@ -231,16 +285,16 @@ class TushareAPI:
         """
         if required_params is None:
             required_params = {}
-            
+
         # 使用小数据量快速测试
         test_limit = 100
         count = 0
         start_time = time.time()
-        
+
         # 构造请求参数，包含必要参数
         params = required_params.copy()
         params["limit"] = test_limit
-        
+
         # 避免循环调用，直接发送请求
         payload = {
             "api_name": api_name,
@@ -248,7 +302,7 @@ class TushareAPI:
             "params": params,
             "fields": ""
         }
-        
+
         while time.time() - start_time < 60:
             try:
                 req = Request(
@@ -271,10 +325,10 @@ class TushareAPI:
                     break
                 else:
                     raise e
-        
+
         # 为了安全起见，返回实际检测到的限制的80%
         return max(1, count)
-    
+
     def get_api_info(self, api_name: str) -> Dict:
         """获取API接口信息，如果没有则进行探测
         
@@ -284,7 +338,7 @@ class TushareAPI:
         # 尝试从缓存获取
         if api_name in self._api_info_cache:
             return self._api_info_cache[api_name]
-            
+
         # 如果禁用了频率限制，使用0表示无限制
         if not self.enable_rate_limit:
             # 只探测单次请求限制，不探测频率限制
@@ -301,7 +355,7 @@ class TushareAPI:
         else:
             # 尝试从CSV文件获取缓存的限制参数
             cached_limits = self.limit_detector.get_api_limits(api_name)
-            
+
             if cached_limits is None:
                 # 没有缓存，进行探测
                 limit_per_request, rate_limit = self._detect_api_limits(api_name)
@@ -309,7 +363,7 @@ class TushareAPI:
                 # 确保是Python原生类型
                 limit_per_request = int(cached_limits["limit_per_request"])
                 rate_limit = int(cached_limits["rate_limit"])
-        
+
         # 保存到缓存
         info = {
             "limit_per_request": limit_per_request,
@@ -324,7 +378,7 @@ class TushareAPI:
         # 避免循环调用，只在非探测模式下检查频率限制
         if self.enable_rate_limit and api_name in self._api_info_cache:
             self._respect_rate_limit(api_name)
-        
+
         payload = {
             "api_name": api_name,
             "token": self.token,
@@ -355,7 +409,7 @@ class TushareAPI:
                 time.sleep(self.retry_delay)
                 return self._make_request(api_name, params, fields, retry_count + 1)
             raise Exception(f"Request failed after {self.max_retries} retries: {str(e)}")
-    
+
     def _should_retry(self, error_code):
         """根据错误码判断是否应该重试"""
         # 可以根据 API 文档中的错误码定义来完善此函数
@@ -367,7 +421,7 @@ class TushareAPI:
             503   # 服务不可用
         ]
         return error_code in retry_error_codes
-    
+
     def _respect_rate_limit(self, api_name):
         """遵守 API 访问频率限制
         
@@ -376,40 +430,40 @@ class TushareAPI:
         # 获取接口的访问频率限制
         api_info = self._api_info_cache.get(api_name, {"rate_limit": 60})
         rate_limit = api_info.get('rate_limit', 60)  # 默认每分钟 60 次
-        
+
         # 如果rate_limit为0，表示没有频率限制，直接返回
         if rate_limit == 0:
             return
-        
+
         # 初始化该 API 的访问历史记录
         if not hasattr(self, '_api_call_history'):
             self._api_call_history = {}
-        
+
         if api_name not in self._api_call_history:
             self._api_call_history[api_name] = []
-        
+
         # 获取当前时间
         now = time.time()
-        
+
         # 清理超过 60 秒的历史记录
         self._api_call_history[api_name] = [t for t in self._api_call_history[api_name] 
                                            if now - t < 60]
-        
+
         # 检查当前窗口内的请求数量
         if len(self._api_call_history[api_name]) >= rate_limit:
             # 计算需要等待的时间
             oldest_call = min(self._api_call_history[api_name])
             wait_time = 60 - (now - oldest_call)
-            
+
             if wait_time > 0:
                 logger.debug(f"等待 {wait_time:.2f} 秒以遵守 {api_name} 的访问频率限制")
                 time.sleep(wait_time)
                 # 更新当前时间
                 now = time.time()
-        
+
         # 记录本次调用时间
         self._api_call_history[api_name].append(now)
-    
+
     def get_data(self, api_name, fields="", auto_paging=True, concurrent=False, max_pages=None, **params):
         """
         获取接口数据并返回DataFrame
@@ -429,22 +483,22 @@ class TushareAPI:
         if not auto_paging:
             data = self._make_request(api_name, params, fields)
             return pd.DataFrame(data["items"], columns=data["fields"])
-        
+
         # 获取接口的单次传输限制
         api_info = self.get_api_info(api_name)
         limit_per_request = api_info.get('limit_per_request', 5000)
-        
+
         # 如果接口没有单次查询上限（值为0），直接请求
         if limit_per_request == 0:
             data = self._make_request(api_name, params, fields)
             return pd.DataFrame(data["items"], columns=data["fields"])
-        
+
         # 设置分页参数
         offset = params.get('offset', 0)
-        
+
         # 用户可能指定了limit参数
         user_limit = params.get('limit', None)
-        
+
         # 如果是并发模式，需要预先确定页数
         if concurrent:
             if max_pages is None:
@@ -453,14 +507,14 @@ class TushareAPI:
                     max_pages = (user_limit + limit_per_request - 1) // limit_per_request
                 else:
                     # 默认尝试10页，用户可以通过max_pages参数调整
-                    max_pages = 10000
+                    max_pages = 1000
                     logger.warning(f"并发模式下未指定max_pages或limit，默认尝试获取{max_pages}页数据")
-            
+
             # 准备分页参数
             page_params = []
             for page in range(max_pages):
                 page_offset = offset + page * limit_per_request
-                
+
                 # 如果用户指定了limit，确保不超过用户指定的总量
                 if user_limit is not None:
                     remaining = user_limit - page * limit_per_request
@@ -469,12 +523,12 @@ class TushareAPI:
                     page_limit = min(limit_per_request, remaining)
                 else:
                     page_limit = limit_per_request
-                
+
                 page_param = params.copy()
                 page_param['offset'] = page_offset
                 page_param['limit'] = page_limit
                 page_params.append((api_name, page_param, fields))
-            
+
             # 使用并发请求
             return self._get_data_concurrent(page_params)
         else:
@@ -482,12 +536,12 @@ class TushareAPI:
             all_data = []
             fields_list = None
             total_fetched = 0
-            
+
             while True:
                 # 复制参数，设置当前页的offset和limit
                 page_params = params.copy()
                 page_params['offset'] = offset
-                
+
                 # 如果用户指定了limit，确保不超过用户指定的总量
                 if user_limit is not None:
                     remaining = user_limit - total_fetched
@@ -496,43 +550,43 @@ class TushareAPI:
                     page_params['limit'] = min(limit_per_request, remaining)
                 else:
                     page_params['limit'] = limit_per_request
-                
+
                 # 请求当前页数据
                 logger.info(f"请求 {api_name} 数据: offset={offset}, limit={page_params['limit']}")
                 data = self._make_request(api_name, page_params, fields)
-                
+
                 # 保存字段名
                 if fields_list is None:
                     fields_list = data["fields"]
-                
+
                 # 获取当前页数据条数
                 current_count = len(data["items"])
-                
+
                 # 添加到结果集
                 all_data.extend(data["items"])
                 total_fetched += current_count
-                
+
                 # 使用has_more字段判断是否还有更多数据
                 has_more = data.get("has_more", False)
                 if not has_more:
                     # API明确表示没有更多数据
                     break
-                
+
                 # 更新offset，准备获取下一页
                 offset += current_count
-                
+
                 # 如果用户指定了limit并且已经达到，停止获取
                 if user_limit is not None and total_fetched >= user_limit:
                     break
-            
+
             logger.info(f"共获取 {len(all_data)} 条 {api_name} 数据")
             return pd.DataFrame(all_data, columns=fields_list)
-    
+
     def _get_data_concurrent(self, page_params):
         """并发请求多页数据"""
         all_data = []
         fields = None
-        
+
         def fetch_page(params_tuple):
             api_name, params, field_str = params_tuple
             logger.info(f"并发请求 {api_name} 数据: offset={params.get('offset', 0)}, limit={params.get('limit', 0)}")
@@ -544,44 +598,44 @@ class TushareAPI:
                     logger.warning(f"偏移量可能超出范围: {str(e)}")
                     return {"fields": field_str.split(",") if field_str else [], "items": [], "has_more": False}
                 raise
-        
+
         # 按照offset排序，确保从小到大处理
         sorted_params = sorted(page_params, key=lambda x: x[1].get('offset', 0))
-        
+
         # 记录连续空结果的数量
         empty_results_count = 0
         max_empty_results = 2 # 连续两页空结果就认为没有更多数据
-        
+
         # 分批提交任务，而不是一次性提交所有任务
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             batch_size = self.max_workers  # 每批提交的任务数量
-            
+
             for i in range(0, len(sorted_params), batch_size):
                 # 如果已经连续获取到多个空结果，提前终止
                 if empty_results_count >= max_empty_results:
                     logger.info(f"连续 {max_empty_results} 页数据为空，提前终止请求")
                     break
-                
+
                 # 获取当前批次的参数
                 batch_params = sorted_params[i:i+batch_size]
-                
+
                 # 提交当前批次的任务
                 future_to_params = {executor.submit(fetch_page, param): param for param in batch_params}
-                
+
                 # 处理当前批次的结果
                 for future in concurrent.futures.as_completed(future_to_params):
                     try:
                         data = future.result()
                         if fields is None and data["fields"]:
                             fields = data["fields"]
-                        
+
                         # 检查结果是否为空
                         if not data["items"]:
                             empty_results_count += 1
                         else:
                             empty_results_count = 0  # 重置计数器
                             all_data.extend(data["items"])
-                        
+
                         # 检查是否还有更多数据
                         has_more = data.get("has_more", None)
                         if has_more is not None and not has_more:
@@ -591,7 +645,42 @@ class TushareAPI:
                         param = future_to_params[future]
                         logger.error(f"请求失败 {param[0]}: {str(e)}")
                         raise
-        
+
         # 如果没有获取到任何数据，返回空DataFrame
         if not fields:
             return pd.DataFrame()
+
+
+class DataCubeAPI(TushareAPI):
+    """
+    用于访问类似Tushare的数据源的客户端，方正DataCube。
+    默认禁用API访问频率限制。
+    """
+    def __init__(
+        self,
+        token=None,
+        max_workers=5,
+        max_retries=3,
+        retry_delay=1,
+        custom_params_file=None,
+    ):
+
+        if not token:
+            token = os.environ.get('DATACUBE_TOKEN')
+
+        if not token:
+            raise ValueError("Token must be provided either as an argument or via DATACUBE_TOKEN environment variable.")
+
+        # 调用父类的构造函数，并明确设置 enable_rate_limit=False
+        super().__init__(
+            token=token,
+            max_workers=max_workers,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            enable_rate_limit=False,  # 禁用频率限制
+            custom_params_file=custom_params_file,
+            api_limits_file="api_limits_datacube.csv"
+        )
+        # 设置新的API URL
+        self.api_url = "http://datacubeapi.foundersc.com"
+        self._api_required_params['fund_nav'] = {'end_date': '20250506'}  # 方正DataCube的必要参数

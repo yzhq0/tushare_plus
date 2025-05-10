@@ -290,6 +290,12 @@ class TushareAPI:
         test_limit = 100
         count = 0
         start_time = time.time()
+        
+        # 初始化该API的访问历史记录（用于后续频率控制）
+        if not hasattr(self, '_api_call_history'):
+            self._api_call_history = {}
+        if api_name not in self._api_call_history:
+            self._api_call_history[api_name] = []
 
         # 构造请求参数，包含必要参数
         params = required_params.copy()
@@ -318,6 +324,8 @@ class TushareAPI:
                             break
                         raise Exception(f"Error {result['code']}: {result['msg']}")
                 count += 1
+                # 记录本次调用时间到访问历史中
+                self._api_call_history[api_name].append(time.time())
                 # 短暂休息以避免立即触发限制
                 # time.sleep(0.1)
             except Exception as e:
@@ -326,8 +334,14 @@ class TushareAPI:
                 else:
                     raise e
 
-        # 为了安全起见，返回实际检测到的限制的80%
-        return max(1, count)
+
+        detected_limit = max(1, count)
+        
+        # 如果探测过程中达到了限制，记录最后一次请求的时间
+        if count > 0 and len(self._api_call_history[api_name]) > 0:
+            logger.info(f"接口 {api_name} 在探测过程中发送了 {count} 次请求，可能需要等待API限制重置")
+            
+        return detected_limit
 
     def get_api_info(self, api_name: str) -> Dict:
         """获取API接口信息，如果没有则进行探测
@@ -359,6 +373,11 @@ class TushareAPI:
             if cached_limits is None:
                 # 没有缓存，进行探测
                 limit_per_request, rate_limit = self._detect_api_limits(api_name)
+                
+                # 探测完成后，检查是否需要等待API限制重置
+                # 确保在探测后有足够的时间间隔再进行实际数据请求
+                if hasattr(self, '_api_call_history') and api_name in self._api_call_history and len(self._api_call_history[api_name]) > 0:
+                    self._respect_rate_limit(api_name)
             else:
                 # 确保是Python原生类型
                 limit_per_request = int(cached_limits["limit_per_request"])

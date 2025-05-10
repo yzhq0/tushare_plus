@@ -260,14 +260,14 @@ class TushareAPI:
                 with urlopen(req) as response:
                     result = json.loads(response.read().decode("utf-8"))
                     if result["code"] != 0:
-                        if "请求过于频繁" in result["msg"]:
+                        if "每分钟最多访问" in result["msg"]:
                             break
                         raise Exception(f"Error {result['code']}: {result['msg']}")
                 count += 1
                 # 短暂休息以避免立即触发限制
                 # time.sleep(0.1)
             except Exception as e:
-                if "请求过于频繁" in str(e):
+                if "每分钟最多访问" in str(e):
                     break
                 else:
                     raise e
@@ -362,7 +362,7 @@ class TushareAPI:
         # 通常，网络错误、服务器临时错误应该重试，参数错误等不应重试
         retry_error_codes = [
             -1,  # 系统错误
-            429,  # 请求过于频繁
+            40203,  # 请求过于频繁
             500,  # 服务器内部错误
             503   # 服务不可用
         ]

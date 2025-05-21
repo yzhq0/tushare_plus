@@ -112,6 +112,24 @@ class APILimitDetector:
         except Exception as e:
             logger.error(f"保存API限制参数失败: {str(e)}")
 
+    def remove_api_limits(self, api_name: str):
+        """从CSV文件删除指定API的限制参数"""
+        if not os.path.exists(self.csv_path) or os.path.getsize(self.csv_path) == 0:
+            logger.warning(f"API限制文件 {self.csv_path} 不存在或为空，无法删除 {api_name} 的限制。")
+            return
+
+        try:
+            df = pd.read_csv(self.csv_path)
+            if api_name in df['api_name'].values:
+                df_filtered = df[df['api_name'] != api_name]
+                # 如果过滤后DataFrame为空，to_csv会写入一个只有表头的文件
+                df_filtered.to_csv(self.csv_path, index=False)
+                logger.info(f"已从 {self.csv_path} 删除 {api_name} 的限制参数。")
+            else:
+                logger.info(f"在 {self.csv_path} 中未找到 {api_name} 的限制参数，无需删除。")
+        except Exception as e:
+            logger.error(f"从 {self.csv_path} 删除 {api_name} 的限制参数失败: {str(e)}")
+
 class TushareAPI:
 
     def __init__(
@@ -390,6 +408,43 @@ class TushareAPI:
         }
         self._api_info_cache[api_name] = info
         return info
+
+    def clear_api_limits(self, api_name: str):
+        """清除指定API的限制参数（内存缓存和CSV文件）"""
+        logger.info(f"开始清除接口 {api_name} 的限制参数...")
+
+        # 从CSV文件清除
+        self.limit_detector.remove_api_limits(api_name)
+
+        # 从内存缓存清除
+        if api_name in self._api_info_cache:
+            del self._api_info_cache[api_name]
+            logger.info(f"已从缓存中清除接口 {api_name} 的限制参数。")
+        else:
+            logger.info(f"接口 {api_name} 的限制参数未在内存缓存中找到。")
+
+    def force_redetect_api_limits(self, api_name: str):
+        """
+        强制清除并重新探测指定API的限制参数。
+        此方法会首先清除该API在内存缓存和CSV文件中的现有记录，
+        然后立即触发新的限制参数探测过程。
+        """
+
+        # 1. 清除现有的限制参数 (包括内存缓存和CSV文件中的记录)
+        # clear_api_limits 方法内部会处理详细的日志记录
+        self.clear_api_limits(api_name)
+
+        # 2. 重新获取API信息，这将触发探测逻辑（因为缓存已被清除）
+        # get_api_info 方法会负责探测、保存到CSV并更新内存缓存
+        logger.info(f"缓存清除完毕，开始为接口 {api_name} 重新进行参数探测。")
+        try:
+            # 调用 get_api_info 会触发探测（如果需要）并返回更新后的信息
+            new_limits = self.get_api_info(api_name)
+
+        except Exception as e:
+            logger.error(f"在为接口 {api_name} 强制重新探测参数时发生错误: {e}")
+            # 即使探测失败，之前的清除操作也已完成
+            logger.info(f"接口 {api_name} 的旧有参数已被清除，但新的探测未能成功。请检查错误信息。")
 
     def _make_request(self, api_name, params, fields, retry_count=0):
         """构造并发送HTTP POST请求，支持重试机制"""

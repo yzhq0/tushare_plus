@@ -40,14 +40,30 @@ from typing import Dict, Optional, Tuple
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('TushareAPI')
 
+# DEFAULT_API_LIMITS_FILENAME = "api_limits.csv" # 不再需要全局默认，由各API类指定
+CONFIG_DIR_NAME = ".tushare_plus"
+
 class APILimitDetector:
-    def __init__(self, csv_path: str = "api_limits.csv"):
+    def __init__(self, csv_path: Optional[str] = None, default_filename: str = "api_limits.csv"):
         """初始化API限制参数检测器
         
         参数:
-            csv_path: API限制参数CSV文件的相对路径
+            csv_path: API限制参数CSV文件的路径。如果为None，则使用用户目录下的默认路径。
+            default_filename: 当 csv_path 为 None 时，在用户目录下使用的默认文件名。
         """
-        self.csv_path = csv_path
+        if csv_path is None:
+            user_home = os.path.expanduser("~")
+            config_dir = os.path.join(user_home, CONFIG_DIR_NAME)
+            self.csv_path = os.path.join(config_dir, default_filename) # 使用传入的 default_filename
+            os.makedirs(config_dir, exist_ok=True)
+            logger.info(f"API限制参数文件将使用默认路径: {self.csv_path}")
+        else:
+            self.csv_path = csv_path
+            dir_name = os.path.dirname(self.csv_path)
+            if dir_name and not os.path.exists(dir_name):
+                os.makedirs(dir_name, exist_ok=True)
+            logger.info(f"API限制参数文件将使用指定路径: {self.csv_path}")
+
         self._init_csv()
     
     def _init_csv(self):
@@ -140,7 +156,8 @@ class TushareAPI:
         retry_delay=1,
         enable_rate_limit=True,
         custom_params_file=None,
-        api_limits_file="api_limits.csv"
+        api_limits_file: Optional[str] = None,
+        api_limits_default_filename: str = "tushare_api_limits.csv" # 新增参数，TushareAPI的默认文件名
     ):
         if token:
             self.token = token
@@ -154,7 +171,12 @@ class TushareAPI:
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.limit_detector = APILimitDetector(api_limits_file)  # 使用传入的文件路径
+        # APILimitDetector 会根据 api_limits_file 是否为 None 来决定路径
+        # 如果 api_limits_file 为 None，则使用 api_limits_default_filename 在用户目录下创建文件
+        self.limit_detector = APILimitDetector(
+            csv_path=api_limits_file, 
+            default_filename=api_limits_default_filename
+        )
         self._api_last_call_time = {}
         self._api_info_cache = {}  # 添加缓存初始化
         self.enable_rate_limit = enable_rate_limit  # 添加频率限制开关
@@ -737,6 +759,7 @@ class DataCubeAPI(TushareAPI):
         max_retries=3,
         retry_delay=1,
         custom_params_file=None,
+        api_limits_file: Optional[str] = None # 允许用户为DataCubeAPI也指定自定义路径
     ):
 
         if not token:

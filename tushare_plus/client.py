@@ -759,7 +759,8 @@ class DataCubeAPI(TushareAPI):
         max_retries=3,
         retry_delay=1,
         custom_params_file=None,
-        api_limits_file: Optional[str] = None # 允许用户为DataCubeAPI也指定自定义路径
+        api_limits_file: Optional[str] = None,
+        api_limits_default_filename: str = "datacube_api_limits.csv"
     ):
 
         if not token:
@@ -776,7 +777,8 @@ class DataCubeAPI(TushareAPI):
             retry_delay=retry_delay,
             enable_rate_limit=False,  # 禁用频率限制
             custom_params_file=custom_params_file,
-            api_limits_file="api_limits_datacube.csv"
+            api_limits_file=api_limits_file,
+            api_limits_default_filename=api_limits_default_filename
         )
         # 设置新的API URL
         self.api_url = "http://datacubeapi.foundersc.com"

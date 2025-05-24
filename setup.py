@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="tushare_plus",
-    version="0.1.4",
+    version="0.1.5",
     author="yzhq0",
     author_email="yangzhq0@live.com",
     description="增强版Tushare API客户端，提供自动分页、并发请求和频率限制功能",

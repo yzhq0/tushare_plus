@@ -3,5 +3,5 @@
 
 from .client import TushareAPI, APILimitDetector, DataCubeAPI
 
-__version__ = '0.1.5'
+__version__ = '0.1.6'
 __all__ = ['TushareAPI', 'APILimitDetector', 'DataCubeAPI']

@@ -159,6 +159,9 @@ class TushareAPI:
         api_limits_file: Optional[str] = None,
         api_limits_default_filename: str = "tushare_api_limits.csv" # 新增参数，TushareAPI的默认文件名
     ):
+        # 创建实例级别的logger，使用实际的类名
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
         if token:
             self.token = token
         else:
@@ -204,9 +207,9 @@ class TushareAPI:
             try:
                 with open(default_params_file, 'r', encoding='utf-8') as f:
                     default_params = json.load(f)
-                    logger.info(f"已加载默认API参数配置: {default_params_file}")
+                    self.logger.info(f"已加载默认API参数配置: {default_params_file}")
             except Exception as e:
-                logger.warning(f"加载默认API参数配置失败: {str(e)}")
+                self.logger.warning(f"加载默认API参数配置失败: {str(e)}")
 
         # 如果提供了自定义配置文件，合并配置
         if custom_params_file and os.path.exists(custom_params_file):
@@ -215,9 +218,9 @@ class TushareAPI:
                     custom_params = json.load(f)
                     # 合并配置，自定义配置优先
                     default_params.update(custom_params)
-                    logger.info(f"已加载自定义API参数配置: {custom_params_file}")
+                    self.logger.info(f"已加载自定义API参数配置: {custom_params_file}")
             except Exception as e:
-                logger.warning(f"加载自定义API参数配置失败: {str(e)}")
+                self.logger.warning(f"加载自定义API参数配置失败: {str(e)}")
 
         return default_params
 
@@ -229,7 +232,7 @@ class TushareAPI:
             params: 参数字典
         """
         self._api_required_params[api_name] = params
-        logger.info(f"已添加API参数: {api_name} = {params}")
+        self.logger.info(f"已添加API参数: {api_name} = {params}")
 
     def _detect_api_limits(self, api_name: str) -> Tuple[int, int]:
         """探测API的限制参数
@@ -237,7 +240,7 @@ class TushareAPI:
         参数:
             api_name: API接口名称
         """
-        logger.info(f"开始探测接口 {api_name} 的限制参数...")
+        self.logger.info(f"开始探测接口 {api_name} 的限制参数...")
 
         # 使用预定义的必要参数，不合并用户传入的参数
         required_params = self._api_required_params.get(api_name, {}).copy()
@@ -250,7 +253,7 @@ class TushareAPI:
 
         # 保存探测结果
         self.limit_detector.save_api_limits(api_name, limit, rate_limit)
-        logger.info(f"接口 {api_name} 的限制参数探测完成：单次限制 {limit}，频率限制 {rate_limit}/分钟")
+        self.logger.info(f"接口 {api_name} 的限制参数探测完成：单次限制 {limit}，频率限制 {rate_limit}/分钟")
 
         return limit, rate_limit
 
@@ -265,7 +268,7 @@ class TushareAPI:
             required_params = {}
 
         try:
-            logger.info(f"开始探测接口 {api_name} 的单次请求限制...")
+            self.logger.info(f"开始探测接口 {api_name} 的单次请求限制...")
             # 构造请求参数，包含必要参数
             params = required_params.copy()
 
@@ -296,24 +299,70 @@ class TushareAPI:
                     # 如果API返回了has_more字段
                     if not has_more:
                         # has_more为False，说明这是所有数据，没有单次请求限制
-                        logger.info(f"接口 {api_name} 可能没有单次请求限制，返回数据量为 {count} 条")
+                        self.logger.info(f"接口 {api_name} 可能没有单次请求限制，返回数据量为 {count} 条")
                         return 0  # 使用0表示没有限制，而不是float('inf')
                     else:
                         # has_more为True，说明有更多数据，当前返回量可能是单次限制
-                        logger.info(f"接口 {api_name} 的单次请求限制为 {count} 条")
+                        self.logger.info(f"接口 {api_name} 的单次请求限制为 {count} 条")
                         return count
                 else:
                     # 如果API没有返回has_more字段，使用原来的判断逻辑
                     if count % 1000 == 0 and count > 0:
-                        logger.info(f"接口 {api_name} 的单次请求限制为 {count} 条")
+                        self.logger.info(f"接口 {api_name} 的单次请求限制为 {count} 条")
                         return count
                     else:
                         # 如果不是1000的整数倍，认为没有限制
-                        logger.info(f"接口 {api_name} 可能没有单次请求限制，返回数据量为 {count} 条")
+                        self.logger.info(f"接口 {api_name} 可能没有单次请求限制，返回数据量为 {count} 条")
                         return 0  # 使用0表示没有限制，而不是float('inf')
         except Exception as e:
-            logger.warning(f"探测接口 {api_name} 的单次请求限制失败: {str(e)}")
-            # 失败时使用默认值
+            self.logger.warning(f"探测接口 {api_name} 的单次请求限制失败: {str(e)}")
+            # 失败时尝试手动指定限制值进行重试
+            self.logger.info(f"开始使用预设限制值重试探测接口 {api_name}...")
+            
+            # 定义尝试的限制值列表，从50万开始，按优化步长递减
+            retry_limits = [500000, 200000, 100000, 50000, 20000, 10000, 5000]
+            
+            for limit_value in retry_limits:
+                try:
+                    self.logger.info(f"尝试使用限制值 {limit_value} 探测接口 {api_name}...")
+                    params = required_params.copy()
+                    params["limit"] = limit_value
+                    
+                    payload = {
+                        "api_name": api_name,
+                        "token": self.token,
+                        "params": params,
+                        "fields": ""
+                    }
+                    req = Request(
+                        self.api_url,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    
+                    # 设置超时时间，避免长时间等待
+                    with urlopen(req, timeout=60) as response:
+                        result = json.loads(response.read().decode("utf-8"))
+                        if result["code"] != 0:
+                            self.logger.warning(f"限制值 {limit_value} 请求失败: {result['msg']}")
+                            continue
+                        
+                        data = result["data"]
+                        count = len(data["items"])
+                        
+                        # 成功获取数据，使用该限制值
+                        self.logger.info(f"成功使用限制值 {limit_value} 探测接口 {api_name}，实际返回 {count} 条数据")
+                        return limit_value
+                        
+                except Exception as retry_error:
+                    self.logger.warning(f"使用限制值 {limit_value} 探测失败: {str(retry_error)}")
+                    # 继续尝试下一个更小的限制值
+                    time.sleep(0.5)  # 短暂延迟，避免频繁请求
+                    continue
+            
+            # 所有尝试都失败，返回默认值
+            self.logger.warning(f"所有重试尝试均失败，接口 {api_name} 使用默认限制值 5000")
             return 5000
 
     def _detect_rate_limit(self, api_name: str, required_params: Dict = None) -> int:
@@ -379,7 +428,7 @@ class TushareAPI:
         
         # 如果探测过程中达到了限制，记录最后一次请求的时间
         if count > 0 and len(self._api_call_history[api_name]) > 0:
-            logger.info(f"接口 {api_name} 在探测过程中发送了 {count} 次请求，可能需要等待API限制重置")
+            self.logger.info(f"接口 {api_name} 在探测过程中发送了 {count} 次请求，可能需要等待API限制重置")
             
         return detected_limit
 
@@ -433,7 +482,7 @@ class TushareAPI:
 
     def clear_api_limits(self, api_name: str):
         """清除指定API的限制参数（内存缓存和CSV文件）"""
-        logger.info(f"开始清除接口 {api_name} 的限制参数...")
+        self.logger.info(f"开始清除接口 {api_name} 的限制参数...")
 
         # 从CSV文件清除
         self.limit_detector.remove_api_limits(api_name)
@@ -441,9 +490,9 @@ class TushareAPI:
         # 从内存缓存清除
         if api_name in self._api_info_cache:
             del self._api_info_cache[api_name]
-            logger.info(f"已从缓存中清除接口 {api_name} 的限制参数。")
+            self.logger.info(f"已从缓存中清除接口 {api_name} 的限制参数。")
         else:
-            logger.info(f"接口 {api_name} 的限制参数未在内存缓存中找到。")
+            self.logger.info(f"接口 {api_name} 的限制参数未在内存缓存中找到。")
 
     def force_redetect_api_limits(self, api_name: str):
         """
@@ -458,15 +507,15 @@ class TushareAPI:
 
         # 2. 重新获取API信息，这将触发探测逻辑（因为缓存已被清除）
         # get_api_info 方法会负责探测、保存到CSV并更新内存缓存
-        logger.info(f"缓存清除完毕，开始为接口 {api_name} 重新进行参数探测。")
+        self.logger.info(f"缓存清除完毕，开始为接口 {api_name} 重新进行参数探测。")
         try:
             # 调用 get_api_info 会触发探测（如果需要）并返回更新后的信息
             new_limits = self.get_api_info(api_name)
 
         except Exception as e:
-            logger.error(f"在为接口 {api_name} 强制重新探测参数时发生错误: {e}")
+            self.logger.error(f"在为接口 {api_name} 强制重新探测参数时发生错误: {e}")
             # 即使探测失败，之前的清除操作也已完成
-            logger.info(f"接口 {api_name} 的旧有参数已被清除，但新的探测未能成功。请检查错误信息。")
+            self.logger.info(f"接口 {api_name} 的旧有参数已被清除，但新的探测未能成功。请检查错误信息。")
 
     def _make_request(self, api_name, params, fields, retry_count=0):
         """构造并发送HTTP POST请求，支持重试机制"""
@@ -494,14 +543,14 @@ class TushareAPI:
                     # 记录错误并根据错误类型定义是否重试
                     error_msg = f"Error {result['code']}: {result['msg']}"
                     if retry_count < self.max_retries and self._should_retry(result["code"]):
-                        logger.warning(f"{api_name} 请求失败，将在 {self.retry_delay} 秒后重试: {error_msg}")
+                        self.logger.warning(f"{api_name} 请求失败，将在 {self.retry_delay} 秒后重试: {error_msg}")
                         time.sleep(self.retry_delay)
                         return self._make_request(api_name, params, fields, retry_count + 1)
                     raise Exception(error_msg)
                 return result["data"]
         except Exception as e:
             if retry_count < self.max_retries:
-                logger.warning(f"{api_name} 请求失败，将在 {self.retry_delay} 秒后重试: {str(e)}")
+                self.logger.warning(f"{api_name} 请求失败，将在 {self.retry_delay} 秒后重试: {str(e)}")
                 time.sleep(self.retry_delay)
                 return self._make_request(api_name, params, fields, retry_count + 1)
             raise Exception(f"Request failed after {self.max_retries} retries: {str(e)}")
@@ -552,7 +601,7 @@ class TushareAPI:
             wait_time = 60 - (now - oldest_call)
 
             if wait_time > 0:
-                logger.debug(f"等待 {wait_time:.2f} 秒以遵守 {api_name} 的访问频率限制")
+                self.logger.debug(f"等待 {wait_time:.2f} 秒以遵守 {api_name} 的访问频率限制")
                 time.sleep(wait_time)
                 # 更新当前时间
                 now = time.time()
@@ -604,7 +653,7 @@ class TushareAPI:
                 else:
                     # 默认尝试10页，用户可以通过max_pages参数调整
                     max_pages = 1000
-                    logger.warning(f"并发模式下未指定max_pages或limit，默认尝试获取{max_pages}页数据")
+                    self.logger.warning(f"并发模式下未指定max_pages或limit，默认尝试获取{max_pages}页数据")
 
             # 准备分页参数
             page_params = []
@@ -648,7 +697,7 @@ class TushareAPI:
                     page_params['limit'] = limit_per_request
 
                 # 请求当前页数据
-                logger.info(f"请求 {api_name} 数据: offset={offset}, limit={page_params['limit']}")
+                self.logger.info(f"请求 {api_name} 数据: offset={offset}, limit={page_params['limit']}")
                 data = self._make_request(api_name, page_params, fields)
 
                 # 保存字段名
@@ -675,7 +724,7 @@ class TushareAPI:
                 if user_limit is not None and total_fetched >= user_limit:
                     break
 
-            logger.info(f"共获取 {len(all_data)} 条 {api_name} 数据")
+            self.logger.info(f"共获取 {len(all_data)} 条 {api_name} 数据")
             return pd.DataFrame(all_data, columns=fields_list)
 
     def _get_data_concurrent(self, page_params):
@@ -685,13 +734,13 @@ class TushareAPI:
 
         def fetch_page(params_tuple):
             api_name, params, field_str = params_tuple
-            logger.info(f"并发请求 {api_name} 数据: offset={params.get('offset', 0)}, limit={params.get('limit', 0)}")
+            self.logger.info(f"并发请求 {api_name} 数据: offset={params.get('offset', 0)}, limit={params.get('limit', 0)}")
             try:
                 return self._make_request(api_name, params, field_str)
             except Exception as e:
                 # 如果是因为偏移量超过了实际数据量，返回空结果
                 if "offset" in str(e).lower() or "超出范围" in str(e):
-                    logger.warning(f"偏移量可能超出范围: {str(e)}")
+                    self.logger.warning(f"偏移量可能超出范围: {str(e)}")
                     return {"fields": field_str.split(",") if field_str else [], "items": [], "has_more": False}
                 raise
 
@@ -709,7 +758,7 @@ class TushareAPI:
             for i in range(0, len(sorted_params), batch_size):
                 # 如果已经连续获取到多个空结果，提前终止
                 if empty_results_count >= max_empty_results:
-                    logger.info(f"连续 {max_empty_results} 页数据为空，提前终止请求")
+                    self.logger.info(f"连续 {max_empty_results} 页数据为空，提前终止请求")
                     break
 
                 # 获取当前批次的参数
@@ -739,7 +788,7 @@ class TushareAPI:
                             empty_results_count = max_empty_results  # 强制提前终止
                     except Exception as e:
                         param = future_to_params[future]
-                        logger.error(f"请求失败 {param[0]}: {str(e)}")
+                        self.logger.error(f"请求失败 {param[0]}: {str(e)}")
                         raise
 
         # 如果没有获取到任何数据，返回空DataFrame

@@ -12,8 +12,21 @@
 
 ## 安装
 
+### 从源代码安装
+
 ```bash
-pip install tushare-plus
+# 克隆仓库
+git clone https://github.com/yzhq0/tushare_plus.git
+cd tushare_plus
+
+# 安装
+pip install -e .
+```
+
+或者直接从源代码安装：
+
+```bash
+pip install git+https://github.com/yzhq0/tushare_plus.git
 ```
 
 ## 快速开始

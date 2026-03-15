@@ -31,7 +31,7 @@ import time
 import logging
 import os
 import csv
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 import pandas as pd
 import concurrent.futures
 from typing import Dict, Optional, Tuple
@@ -155,6 +155,7 @@ class TushareAPI:
         max_retries=3,
         retry_delay=1,
         enable_rate_limit=True,
+        use_env_proxy: bool = True,
         custom_params_file=None,
         api_limits_file: Optional[str] = None,
         api_limits_default_filename: str = "tushare_api_limits.csv" # 新增参数，TushareAPI的默认文件名
@@ -174,6 +175,8 @@ class TushareAPI:
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.use_env_proxy = use_env_proxy
+        self._url_opener = self._build_url_opener()
         # APILimitDetector 会根据 api_limits_file 是否为 None 来决定路径
         # 如果 api_limits_file 为 None，则使用 api_limits_default_filename 在用户目录下创建文件
         self.limit_detector = APILimitDetector(
@@ -186,6 +189,16 @@ class TushareAPI:
 
         # 加载API参数配置
         self._api_required_params = self._load_api_params(custom_params_file)
+
+    def _build_url_opener(self):
+        if self.use_env_proxy:
+            return build_opener()
+        return build_opener(ProxyHandler({}))
+
+    def _urlopen(self, request: Request, timeout: Optional[float] = None):
+        if timeout is None:
+            return self._url_opener.open(request)
+        return self._url_opener.open(request, timeout=timeout)
 
     def _load_api_params(self, custom_params_file=None):
         """加载API参数配置
@@ -285,7 +298,7 @@ class TushareAPI:
                 headers={"Content-Type": "application/json"},
                 method="POST"
             )
-            with urlopen(req) as response:
+            with self._urlopen(req) as response:
                 result = json.loads(response.read().decode("utf-8"))
                 if result["code"] != 0:
                     raise Exception(f"Error {result['code']}: {result['msg']}")
@@ -342,7 +355,7 @@ class TushareAPI:
                     )
                     
                     # 设置超时时间，避免长时间等待
-                    with urlopen(req, timeout=60) as response:
+                    with self._urlopen(req, timeout=60) as response:
                         result = json.loads(response.read().decode("utf-8"))
                         if result["code"] != 0:
                             self.logger.warning(f"限制值 {limit_value} 请求失败: {result['msg']}")
@@ -406,7 +419,7 @@ class TushareAPI:
                     headers={"Content-Type": "application/json"},
                     method="POST"
                 )
-                with urlopen(req) as response:
+                with self._urlopen(req) as response:
                     result = json.loads(response.read().decode("utf-8"))
                     if result["code"] != 0:
                         if "每分钟最多访问" in result["msg"]:
@@ -537,7 +550,7 @@ class TushareAPI:
             method="POST"
         )
         try:
-            with urlopen(req) as response:
+            with self._urlopen(req) as response:
                 result = json.loads(response.read().decode("utf-8"))
                 if result["code"] != 0:
                     # 记录错误并根据错误类型定义是否重试
@@ -825,6 +838,7 @@ class DataCubeAPI(TushareAPI):
             max_retries=max_retries,
             retry_delay=retry_delay,
             enable_rate_limit=False,  # 禁用频率限制
+            use_env_proxy=False,
             custom_params_file=custom_params_file,
             api_limits_file=api_limits_file,
             api_limits_default_filename=api_limits_default_filename

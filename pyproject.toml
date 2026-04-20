@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tushare_plus"
-version = "0.1.7"
+version = "0.1.8"
 description = "增强版Tushare API客户端，提供自动分页、并发请求和频率限制功能"
 readme = "README.md"
 authors = [

@@ -98,7 +98,9 @@ client = TushareAPI(
 
 ### 跳过或覆盖限制探测
 
-大表生产任务如果已经知道分页大小，可以显式传入 `limit_per_request`，避免首次无界探测带来的额外耗时。
+首次使用某个接口时，建议保留默认探测逻辑。DataCube 或 Tushare 页面上的限制参数可能滞后，运行时探测结果更可靠。
+
+如果接口已经通过历史运行或本地缓存验证过分页大小，可以显式传入 `limit_per_request`，避免重复探测带来的额外耗时。`detect_limit=False` 只适合已验证接口的复跑；未验证接口的大批量生产不要直接跳过探测。
 
 ```python
 df = client.get_data(
@@ -114,7 +116,33 @@ df = client.get_data(
     fields="ts_code,trade_date,open,high,low,close,vol",
     start_date="20260101",
     end_date="20260131",
-    detect_limit=False,  # 使用默认分页大小5000，不触发自动探测
+    detect_limit=False,  # 已验证接口复跑时，使用默认分页大小5000，不触发自动探测
+)
+```
+
+### 返回类型
+
+`get_data` 默认返回 `pandas.DataFrame`。如果下游计算使用 Polars、Arrow，或需要保留原始 API 结构，可以通过 `return_type` 切换。
+
+```python
+df = client.get_data("daily", fields="ts_code,trade_date,close")
+
+raw = client.get_data(
+    "daily",
+    fields="ts_code,trade_date,close",
+    return_type="raw",  # {"fields": [...], "items": [[...], ...]}
+)
+
+polars_df = client.get_data(
+    "daily",
+    fields="ts_code,trade_date,close",
+    return_type="polars",  # 需要安装 polars
+)
+
+arrow_table = client.get_data(
+    "daily",
+    fields="ts_code,trade_date,close",
+    return_type="arrow",  # 需要安装 pyarrow
 )
 ```
 

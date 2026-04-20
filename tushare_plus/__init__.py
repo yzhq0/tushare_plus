@@ -3,5 +3,5 @@
 
 from .client import APIResponseError, TushareAPI, APILimitDetector, DataCubeAPI
 
-__version__ = '0.1.7'
+__version__ = '0.1.8'
 __all__ = ['TushareAPI', 'APILimitDetector', 'DataCubeAPI', 'APIResponseError']

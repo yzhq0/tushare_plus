@@ -37,7 +37,7 @@ from pathlib import Path
 from urllib.request import ProxyHandler, Request, build_opener
 import pandas as pd
 import concurrent.futures
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -660,6 +660,44 @@ class TushareAPI:
         # 记录本次调用时间
         self._api_call_history[api_name].append(now)
 
+    def _format_rows(self, fields, items, return_type: str = "pandas"):
+        """Convert API rows to the requested return type."""
+        self._validate_return_type(return_type)
+        normalized_fields = list(fields or [])
+        normalized_items = list(items or [])
+
+        if return_type == "raw":
+            return {"fields": normalized_fields, "items": normalized_items}
+
+        frame = pd.DataFrame(normalized_items, columns=normalized_fields)
+
+        if return_type == "pandas":
+            return frame
+
+        if return_type == "polars":
+            try:
+                import polars as pl
+            except ImportError as exc:
+                raise ImportError("return_type='polars' requires the optional 'polars' package") from exc
+            return pl.from_pandas(frame)
+
+        try:
+            import pyarrow as pa
+        except ImportError as exc:
+            raise ImportError("return_type='arrow' requires the optional 'pyarrow' package") from exc
+        return pa.Table.from_pandas(frame, preserve_index=False)
+
+    def _format_response_data(self, data: Dict[str, Any], return_type: str = "pandas"):
+        """Convert one API response payload to the requested return type."""
+        self._validate_return_type(return_type)
+        if return_type == "raw":
+            return dict(data)
+        return self._format_rows(data.get("fields", []), data.get("items", []), return_type)
+
+    def _validate_return_type(self, return_type: str) -> None:
+        if return_type not in {"pandas", "polars", "arrow", "raw"}:
+            raise ValueError("return_type must be one of: pandas, polars, arrow, raw")
+
     def get_data(
         self,
         api_name,
@@ -669,10 +707,11 @@ class TushareAPI:
         max_pages=None,
         limit_per_request: Optional[int] = None,
         detect_limit: bool = True,
+        return_type: str = "pandas",
         **params
     ):
         """
-        获取接口数据并返回DataFrame
+        获取接口数据并按指定格式返回
         
         参数:
             api_name: API接口名称
@@ -682,15 +721,18 @@ class TushareAPI:
             max_pages: 最大分页数量，用于并发模式下控制请求数量
             limit_per_request: 手工指定单次分页大小，指定后不会触发限制探测
             detect_limit: 是否自动探测单次请求限制；为False且未指定limit_per_request时使用5000
+            return_type: 返回类型，支持 pandas、polars、arrow、raw；默认pandas
             **params: API的其他参数
         
         返回:
-            包含请求数据的DataFrame
+            pandas.DataFrame、polars.DataFrame、pyarrow.Table 或原始API字典
         """
+        self._validate_return_type(return_type)
+
         # 如果不需要自动分页，直接调用原始方法
         if not auto_paging:
             data = self._make_request(api_name, params, fields)
-            return pd.DataFrame(data["items"], columns=data["fields"])
+            return self._format_response_data(data, return_type)
 
         # 获取接口的单次传输限制；大表生产任务可显式传入以跳过昂贵探测。
         if limit_per_request is None:
@@ -703,7 +745,7 @@ class TushareAPI:
         # 如果接口没有单次查询上限（值为0），直接请求
         if limit_per_request == 0:
             data = self._make_request(api_name, params, fields)
-            return pd.DataFrame(data["items"], columns=data["fields"])
+            return self._format_response_data(data, return_type)
 
         # 设置分页参数
         offset = params.get('offset', 0)
@@ -742,7 +784,7 @@ class TushareAPI:
                 page_params.append((api_name, page_param, fields))
 
             # 使用并发请求
-            return self._get_data_concurrent(page_params)
+            return self._get_data_concurrent(page_params, return_type=return_type)
         else:
             # 顺序模式，循环获取所有数据
             all_data = []
@@ -797,9 +839,9 @@ class TushareAPI:
                     break
 
             self.logger.info(f"共获取 {len(all_data)} 条 {api_name} 数据")
-            return pd.DataFrame(all_data, columns=fields_list)
+            return self._format_rows(fields_list, all_data, return_type)
 
-    def _get_data_concurrent(self, page_params):
+    def _get_data_concurrent(self, page_params, return_type: str = "pandas"):
         """并发请求多页数据"""
         fields = None
         results_by_offset = {}
@@ -871,11 +913,11 @@ class TushareAPI:
 
         # 如果没有获取到任何数据，返回空DataFrame
         if not fields:
-            return pd.DataFrame()
+            return self._format_rows([], [], return_type)
         all_data = []
         for offset in sorted(results_by_offset):
             all_data.extend(results_by_offset[offset]["items"])
-        return pd.DataFrame(all_data, columns=fields)
+        return self._format_rows(fields, all_data, return_type)
 
     def iter_data(
         self,
@@ -887,6 +929,7 @@ class TushareAPI:
         max_pages=None,
         limit_per_request: Optional[int] = None,
         detect_limit: bool = True,
+        return_type: str = "pandas",
         continue_on_error: bool = False,
         **base_params
     ):
@@ -907,6 +950,7 @@ class TushareAPI:
                     max_pages=max_pages,
                     limit_per_request=limit_per_request,
                     detect_limit=detect_limit,
+                    return_type=return_type,
                     **request_params
                 )
                 yield request_params, frame

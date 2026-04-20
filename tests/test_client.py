@@ -109,6 +109,65 @@ def test_datacube_concurrent_paging_returns_dataframe_in_offset_order(tmp_path):
     assert frame["value"].tolist() == [0, 1, 2, 3, 4, 5]
 
 
+def test_datacube_get_data_supports_raw_return_type(tmp_path):
+    client = FakePagedDataCubeAPI(tmp_path, total_rows=3)
+
+    data = client.get_data(
+        "fake",
+        fields="value",
+        limit=3,
+        limit_per_request=2,
+        return_type="raw",
+    )
+
+    assert data == {"fields": ["value"], "items": [[0], [1], [2]]}
+
+
+def test_datacube_get_data_supports_polars_return_type(tmp_path):
+    pl = pytest.importorskip("polars")
+    client = FakePagedDataCubeAPI(tmp_path, total_rows=3)
+
+    frame = client.get_data(
+        "fake",
+        fields="value",
+        limit=3,
+        limit_per_request=2,
+        return_type="polars",
+    )
+
+    assert isinstance(frame, pl.DataFrame)
+    assert frame["value"].to_list() == [0, 1, 2]
+
+
+def test_datacube_get_data_supports_arrow_return_type(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    client = FakePagedDataCubeAPI(tmp_path, total_rows=3)
+
+    table = client.get_data(
+        "fake",
+        fields="value",
+        limit=3,
+        limit_per_request=2,
+        return_type="arrow",
+    )
+
+    assert isinstance(table, pa.Table)
+    assert table.column("value").to_pylist() == [0, 1, 2]
+
+
+def test_get_data_rejects_unknown_return_type(tmp_path):
+    client = FakePagedDataCubeAPI(tmp_path, total_rows=1)
+
+    with pytest.raises(ValueError, match="return_type"):
+        client.get_data(
+            "fake",
+            fields="value",
+            limit=1,
+            limit_per_request=1,
+            return_type="records",
+        )
+
+
 def test_get_data_can_skip_limit_detection(tmp_path):
     class NoDetectAPI(FakePagedAPI):
         def get_api_info(self, api_name):
@@ -353,3 +412,20 @@ def test_datacube_iter_data_and_download_partitions_are_generic_chunk_primitives
         "limit=2__trade_date=20260102.csv",
     ]
     assert pd.read_csv(paths[0])["value"].tolist() == [0, 1]
+
+
+def test_datacube_iter_data_passes_return_type(tmp_path):
+    client = FakePagedDataCubeAPI(tmp_path, total_rows=2)
+
+    iterated = list(
+        client.iter_data(
+            "fake",
+            [{"trade_date": "20260101"}],
+            fields="value",
+            limit=2,
+            limit_per_request=2,
+            return_type="raw",
+        )
+    )
+
+    assert iterated[0][1] == {"fields": ["value"], "items": [[0], [1]]}

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tushare_plus"
+version = "0.1.7"
+description = "增强版Tushare API客户端，提供自动分页、并发请求和频率限制功能"
+readme = "README.md"
+authors = [
+    {name = "yzhq0", email = "yangzhq0@live.com"}
+]
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["tushare", "finance", "stock", "data", "api"]
+requires-python = ">=3.6"
+dependencies = [
+    "pandas>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yzhq0/tushare_plus"
+Repository = "https://github.com/yzhq0/tushare_plus"
+Issues = "https://github.com/yzhq0/tushare_plus/issues"
+
+[tool.setuptools]
+packages = ["tushare_plus"]

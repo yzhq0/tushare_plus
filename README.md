@@ -83,6 +83,68 @@ client = TushareAPI(token="your_token_here", max_workers=10)
 client = TushareAPI(token="your_token_here", max_retries=5, retry_delay=2)
 ```
 
+### 长任务稳定性
+
+```python
+client = TushareAPI(
+    token="your_token_here",
+    request_timeout=60,  # 单次HTTP请求超时，None表示不设置
+    max_retries=5,
+    retry_delay=1,
+    retry_backoff=2.0,   # 指数退避
+    retry_jitter=0.1,    # 随机抖动，降低并发重试同步冲击
+)
+```
+
+### 跳过或覆盖限制探测
+
+大表生产任务如果已经知道分页大小，可以显式传入 `limit_per_request`，避免首次无界探测带来的额外耗时。
+
+```python
+df = client.get_data(
+    api_name="daily",
+    fields="ts_code,trade_date,open,high,low,close,vol",
+    start_date="20260101",
+    end_date="20260131",
+    limit_per_request=5000,
+)
+
+df = client.get_data(
+    api_name="daily",
+    fields="ts_code,trade_date,open,high,low,close,vol",
+    start_date="20260101",
+    end_date="20260131",
+    detect_limit=False,  # 使用默认分页大小5000，不触发自动探测
+)
+```
+
+### 通用分块下载
+
+`iter_data` 和 `download_partitions` 只提供通用执行原语，不内置任何接口或业务profile。调用方负责按业务场景构造日期块、代码块或其他参数块。
+
+```python
+chunks = [
+    {"trade_date": "20260105"},
+    {"trade_date": "20260106"},
+]
+
+for params, df in client.iter_data(
+    "daily",
+    chunks,
+    fields="ts_code,trade_date,close,vol",
+    limit_per_request=5000,
+):
+    print(params, len(df))
+
+paths = client.download_partitions(
+    "daily",
+    chunks,
+    "output/daily",
+    fields="ts_code,trade_date,close,vol",
+    limit_per_request=5000,
+)
+```
+
 ## 与官方SDK的区别
 
 相比官方的Tushare SDK，Tushare Plus提供了以下增强功能：

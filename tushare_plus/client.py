@@ -31,10 +31,13 @@ import time
 import logging
 import os
 import csv
+import random
+import re
+from pathlib import Path
 from urllib.request import ProxyHandler, Request, build_opener
 import pandas as pd
 import concurrent.futures
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -42,6 +45,21 @@ logger = logging.getLogger('TushareAPI')
 
 # DEFAULT_API_LIMITS_FILENAME = "api_limits.csv" # 不再需要全局默认，由各API类指定
 CONFIG_DIR_NAME = ".tushare_plus"
+
+
+class APIResponseError(Exception):
+    """API returned a non-zero code."""
+
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+        super().__init__(f"Error {code}: {message}")
+
+
+def _safe_filename_part(value) -> str:
+    text = str(value)
+    text = re.sub(r"[^0-9A-Za-z._=-]+", "_", text)
+    return text.strip("._") or "empty"
 
 class APILimitDetector:
     def __init__(self, csv_path: Optional[str] = None, default_filename: str = "api_limits.csv"):
@@ -154,6 +172,10 @@ class TushareAPI:
         max_workers=5,
         max_retries=3,
         retry_delay=1,
+        retry_backoff=2.0,
+        retry_jitter=0.1,
+        max_retry_delay=60,
+        request_timeout: Optional[float] = 60,
         enable_rate_limit=True,
         use_env_proxy: bool = True,
         custom_params_file=None,
@@ -175,6 +197,10 @@ class TushareAPI:
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.retry_backoff = retry_backoff
+        self.retry_jitter = retry_jitter
+        self.max_retry_delay = max_retry_delay
+        self.request_timeout = request_timeout
         self.use_env_proxy = use_env_proxy
         self._url_opener = self._build_url_opener()
         # APILimitDetector 会根据 api_limits_file 是否为 None 来决定路径
@@ -196,9 +222,10 @@ class TushareAPI:
         return build_opener(ProxyHandler({}))
 
     def _urlopen(self, request: Request, timeout: Optional[float] = None):
-        if timeout is None:
+        effective_timeout = self.request_timeout if timeout is None else timeout
+        if effective_timeout is None:
             return self._url_opener.open(request)
-        return self._url_opener.open(request, timeout=timeout)
+        return self._url_opener.open(request, timeout=effective_timeout)
 
     def _load_api_params(self, custom_params_file=None):
         """加载API参数配置
@@ -530,6 +557,15 @@ class TushareAPI:
             # 即使探测失败，之前的清除操作也已完成
             self.logger.info(f"接口 {api_name} 的旧有参数已被清除，但新的探测未能成功。请检查错误信息。")
 
+    def _retry_sleep(self, retry_count: int) -> None:
+        delay = self.retry_delay * (self.retry_backoff ** retry_count)
+        if self.max_retry_delay is not None:
+            delay = min(delay, self.max_retry_delay)
+        if self.retry_jitter:
+            delay += random.uniform(0, delay * self.retry_jitter)
+        if delay > 0:
+            time.sleep(delay)
+
     def _make_request(self, api_name, params, fields, retry_count=0):
         """构造并发送HTTP POST请求，支持重试机制"""
         # 检查并遵守访问频率限制
@@ -554,17 +590,19 @@ class TushareAPI:
                 result = json.loads(response.read().decode("utf-8"))
                 if result["code"] != 0:
                     # 记录错误并根据错误类型定义是否重试
-                    error_msg = f"Error {result['code']}: {result['msg']}"
                     if retry_count < self.max_retries and self._should_retry(result["code"]):
-                        self.logger.warning(f"{api_name} 请求失败，将在 {self.retry_delay} 秒后重试: {error_msg}")
-                        time.sleep(self.retry_delay)
+                        error_msg = f"Error {result['code']}: {result['msg']}"
+                        self.logger.warning(f"{api_name} 请求失败，将重试: {error_msg}")
+                        self._retry_sleep(retry_count)
                         return self._make_request(api_name, params, fields, retry_count + 1)
-                    raise Exception(error_msg)
+                    raise APIResponseError(result["code"], result["msg"])
                 return result["data"]
         except Exception as e:
+            if isinstance(e, APIResponseError) and not self._should_retry(e.code):
+                raise
             if retry_count < self.max_retries:
-                self.logger.warning(f"{api_name} 请求失败，将在 {self.retry_delay} 秒后重试: {str(e)}")
-                time.sleep(self.retry_delay)
+                self.logger.warning(f"{api_name} 请求失败，将重试: {str(e)}")
+                self._retry_sleep(retry_count)
                 return self._make_request(api_name, params, fields, retry_count + 1)
             raise Exception(f"Request failed after {self.max_retries} retries: {str(e)}")
 
@@ -622,7 +660,17 @@ class TushareAPI:
         # 记录本次调用时间
         self._api_call_history[api_name].append(now)
 
-    def get_data(self, api_name, fields="", auto_paging=True, concurrent=False, max_pages=None, **params):
+    def get_data(
+        self,
+        api_name,
+        fields="",
+        auto_paging=True,
+        concurrent=False,
+        max_pages=None,
+        limit_per_request: Optional[int] = None,
+        detect_limit: bool = True,
+        **params
+    ):
         """
         获取接口数据并返回DataFrame
         
@@ -632,6 +680,8 @@ class TushareAPI:
             auto_paging: 是否自动处理分页
             concurrent: 是否使用并发请求
             max_pages: 最大分页数量，用于并发模式下控制请求数量
+            limit_per_request: 手工指定单次分页大小，指定后不会触发限制探测
+            detect_limit: 是否自动探测单次请求限制；为False且未指定limit_per_request时使用5000
             **params: API的其他参数
         
         返回:
@@ -642,9 +692,13 @@ class TushareAPI:
             data = self._make_request(api_name, params, fields)
             return pd.DataFrame(data["items"], columns=data["fields"])
 
-        # 获取接口的单次传输限制
-        api_info = self.get_api_info(api_name)
-        limit_per_request = api_info.get('limit_per_request', 5000)
+        # 获取接口的单次传输限制；大表生产任务可显式传入以跳过昂贵探测。
+        if limit_per_request is None:
+            if detect_limit:
+                api_info = self.get_api_info(api_name)
+                limit_per_request = api_info.get('limit_per_request', 5000)
+            else:
+                limit_per_request = 5000
 
         # 如果接口没有单次查询上限（值为0），直接请求
         if limit_per_request == 0:
@@ -724,10 +778,15 @@ class TushareAPI:
                 all_data.extend(data["items"])
                 total_fetched += current_count
 
-                # 使用has_more字段判断是否还有更多数据
-                has_more = data.get("has_more", False)
-                if not has_more:
-                    # API明确表示没有更多数据
+                if current_count == 0:
+                    self.logger.warning(f"{api_name} 返回空页，停止分页以避免死循环")
+                    break
+
+                # 优先使用has_more；老接口缺失该字段时，用短页判断结束。
+                has_more = data.get("has_more", None)
+                if has_more is False:
+                    break
+                if has_more is None and current_count < page_params['limit']:
                     break
 
                 # 更新offset，准备获取下一页
@@ -742,8 +801,8 @@ class TushareAPI:
 
     def _get_data_concurrent(self, page_params):
         """并发请求多页数据"""
-        all_data = []
         fields = None
+        results_by_offset = {}
 
         def fetch_page(params_tuple):
             api_name, params, field_str = params_tuple
@@ -760,9 +819,9 @@ class TushareAPI:
         # 按照offset排序，确保从小到大处理
         sorted_params = sorted(page_params, key=lambda x: x[1].get('offset', 0))
 
-        # 记录连续空结果的数量
         empty_results_count = 0
         max_empty_results = 2 # 连续两页空结果就认为没有更多数据
+        should_stop = False
 
         # 分批提交任务，而不是一次性提交所有任务
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -770,7 +829,7 @@ class TushareAPI:
 
             for i in range(0, len(sorted_params), batch_size):
                 # 如果已经连续获取到多个空结果，提前终止
-                if empty_results_count >= max_empty_results:
+                if should_stop or empty_results_count >= max_empty_results:
                     self.logger.info(f"连续 {max_empty_results} 页数据为空，提前终止请求")
                     break
 
@@ -780,33 +839,150 @@ class TushareAPI:
                 # 提交当前批次的任务
                 future_to_params = {executor.submit(fetch_page, param): param for param in batch_params}
 
-                # 处理当前批次的结果
+                batch_results = []
                 for future in concurrent.futures.as_completed(future_to_params):
                     try:
                         data = future.result()
-                        if fields is None and data["fields"]:
-                            fields = data["fields"]
-
-                        # 检查结果是否为空
-                        if not data["items"]:
-                            empty_results_count += 1
-                        else:
-                            empty_results_count = 0  # 重置计数器
-                            all_data.extend(data["items"])
-
-                        # 检查是否还有更多数据
-                        has_more = data.get("has_more", None)
-                        if has_more is not None and not has_more:
-                            # API明确表示没有更多数据
-                            empty_results_count = max_empty_results  # 强制提前终止
+                        param = future_to_params[future]
+                        batch_results.append((param[1].get('offset', 0), data))
                     except Exception as e:
                         param = future_to_params[future]
                         self.logger.error(f"请求失败 {param[0]}: {str(e)}")
                         raise
 
+                # 按offset处理结果，避免as_completed导致返回顺序不稳定。
+                for offset, data in sorted(batch_results, key=lambda item: item[0]):
+                    if fields is None and data["fields"]:
+                        fields = data["fields"]
+
+                    # 检查结果是否为空
+                    if not data["items"]:
+                        empty_results_count += 1
+                    else:
+                        empty_results_count = 0  # 重置计数器
+                        results_by_offset[offset] = data
+
+                    # 检查是否还有更多数据
+                    has_more = data.get("has_more", None)
+                    if has_more is not None and not has_more:
+                        # API明确表示没有更多数据
+                        should_stop = True
+                        break
+
         # 如果没有获取到任何数据，返回空DataFrame
         if not fields:
             return pd.DataFrame()
+        all_data = []
+        for offset in sorted(results_by_offset):
+            all_data.extend(results_by_offset[offset]["items"])
+        return pd.DataFrame(all_data, columns=fields)
+
+    def iter_data(
+        self,
+        api_name,
+        param_chunks: Iterable[Dict],
+        fields="",
+        auto_paging=True,
+        concurrent=False,
+        max_pages=None,
+        limit_per_request: Optional[int] = None,
+        detect_limit: bool = True,
+        continue_on_error: bool = False,
+        **base_params
+    ):
+        """逐个参数块拉取数据。
+
+        该方法只提供通用执行原语，不内置任何接口或业务profile。调用方负责
+        构造按日期、代码、月份或其他维度拆好的param_chunks。
+        """
+        for chunk_params in param_chunks:
+            request_params = base_params.copy()
+            request_params.update(chunk_params)
+            try:
+                frame = self.get_data(
+                    api_name,
+                    fields=fields,
+                    auto_paging=auto_paging,
+                    concurrent=concurrent,
+                    max_pages=max_pages,
+                    limit_per_request=limit_per_request,
+                    detect_limit=detect_limit,
+                    **request_params
+                )
+                yield request_params, frame
+            except Exception:
+                if not continue_on_error:
+                    raise
+                self.logger.exception(f"{api_name} 参数块请求失败，已跳过: {request_params}")
+                yield request_params, None
+
+    def _default_partition_name(self, index: int, params: Dict, file_format: str) -> str:
+        if not params:
+            return f"part-{index:06d}.{file_format}"
+        parts = [f"{_safe_filename_part(key)}={_safe_filename_part(value)}" for key, value in sorted(params.items())]
+        return "__".join(parts) + f".{file_format}"
+
+    def download_partitions(
+        self,
+        api_name,
+        param_chunks: Iterable[Dict],
+        output_dir,
+        fields="",
+        file_format="csv",
+        partition_filename: Optional[Callable[[int, Dict], str]] = None,
+        skip_existing: bool = True,
+        auto_paging=True,
+        concurrent=False,
+        max_pages=None,
+        limit_per_request: Optional[int] = None,
+        detect_limit: bool = True,
+        continue_on_error: bool = False,
+        **base_params
+    ) -> List[Path]:
+        """按参数块下载并落盘。
+
+        支持csv和parquet。parquet依赖pandas运行环境中的可用engine。
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        written_paths = []
+
+        for index, chunk_params in enumerate(param_chunks):
+            request_params = base_params.copy()
+            request_params.update(chunk_params)
+            if partition_filename is None:
+                filename = self._default_partition_name(index, request_params, file_format)
+            else:
+                filename = partition_filename(index, request_params)
+            path = output_path / filename
+            if skip_existing and path.exists():
+                written_paths.append(path)
+                continue
+
+            try:
+                frame = self.get_data(
+                    api_name,
+                    fields=fields,
+                    auto_paging=auto_paging,
+                    concurrent=concurrent,
+                    max_pages=max_pages,
+                    limit_per_request=limit_per_request,
+                    detect_limit=detect_limit,
+                    **request_params
+                )
+                if file_format == "csv":
+                    frame.to_csv(path, index=False)
+                elif file_format == "parquet":
+                    frame.to_parquet(path, index=False)
+                else:
+                    raise ValueError("file_format must be 'csv' or 'parquet'")
+                written_paths.append(path)
+            except Exception:
+                if not continue_on_error:
+                    raise
+                self.logger.exception(f"{api_name} 参数块落盘失败，已跳过: {request_params}")
+
+        return written_paths
 
 
 class DataCubeAPI(TushareAPI):
@@ -820,6 +996,10 @@ class DataCubeAPI(TushareAPI):
         max_workers=5,
         max_retries=3,
         retry_delay=1,
+        retry_backoff=2.0,
+        retry_jitter=0.1,
+        max_retry_delay=60,
+        request_timeout: Optional[float] = 60,
         custom_params_file=None,
         api_limits_file: Optional[str] = None,
         api_limits_default_filename: str = "datacube_api_limits.csv"
@@ -837,6 +1017,10 @@ class DataCubeAPI(TushareAPI):
             max_workers=max_workers,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            retry_backoff=retry_backoff,
+            retry_jitter=retry_jitter,
+            max_retry_delay=max_retry_delay,
+            request_timeout=request_timeout,
             enable_rate_limit=False,  # 禁用频率限制
             use_env_proxy=False,
             custom_params_file=custom_params_file,

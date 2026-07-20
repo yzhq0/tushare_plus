@@ -9,6 +9,8 @@
 - **并发请求**：支持并发请求，提高大量数据获取效率
 - **频率控制**：实现访问频率控制，避免触发API调用限制
 - **错误处理**：内置错误处理和自动重试机制
+- **完整性审计**：严格分页终止、跨页schema/主键检查和逐页报告
+- **可恢复分区**：原子文件、哈希sidecar、执行manifest和跨进程排他锁
 
 ## 安装
 
@@ -28,6 +30,10 @@ pip install -e .
 ```bash
 pip install git+https://github.com/yzhq0/tushare_plus.git
 ```
+
+项目继续支持 Python 3.6。构建依赖会在 Python 3.6 使用兼容的
+`setuptools<60`/`wheel<0.38`，较新Python使用现代setuptools。当前代码会做
+Python 3.6语法门禁；发布前仍建议在真实Python 3.6环境运行完整测试矩阵。
 
 ## 快速开始
 
@@ -146,16 +152,110 @@ arrow_table = client.get_data(
 )
 ```
 
-### 通用分块下载
+### 严格分页与逐页报告
 
-`iter_data` 和 `download_partitions` 只提供通用执行原语，不内置任何接口或业务profile。调用方负责按业务场景构造日期块、代码块或其他参数块。
+`get_data` 的默认返回值保持不变。设置 `return_report=True` 后返回
+`(data, PaginationReport)`；声明 `primary_key` 可在服务端offset分页发生重叠时立即失败。
 
 ```python
+from tushare_plus import PaginationIncompleteError, PaginationProtocolError
+
+df, report = client.get_data(
+    "daily",
+    fields="ts_code,trade_date,close",
+    start_date="20260101",
+    end_date="20260131",
+    limit_per_request=5000,
+    max_pages=100,
+    primary_key=("ts_code", "trade_date"),
+    strict_paging=True,
+    return_report=True,
+)
+
+print(report.request_satisfied, report.source_exhausted)
+print(report.pages)  # 每页offset、请求量、返回量、has_more和可选首末主键
+```
+
+严格模式会拒绝以下情况：达到 `max_pages` 但仍有更多数据、空页却
+`has_more=True`、跨页字段变化、并发页被服务端静默缩短，以及同一并发批次中
+较低页声称取尽但更高页仍返回数据。顺序和并发模式都会拒绝在新offset重复出现的
+相同非空页，以防服务端忽略offset后产生无限循环或把重复行误计为显式limit。
+无 `has_more` 的旧接口在顺序模式下会继续请求到
+空页，并以 `exhaustion_inferred=True` 记录“推断取尽”；并发模式不会用非空短页推断安全offset。
+
+`auto_paging=False` 明确表示只执行一次请求。无显式 `limit` 时，单次调用成功即
+`request_satisfied=True`，即使服务端仍有更多数据；若指定 `limit=N`，严格模式会拒绝
+返回超过N行，或返回少于N行却同时声明 `has_more=True` 的矛盾响应。
+
+`complete`/`request_satisfied` 表示调用方声明的请求已经完成，例如达到显式 `limit`；
+这不等于整个数据源已经取尽。`source_exhausted` 只记录服务端明确的取尽声明。
+业务数据集是否完整仍需调用方根据预期主键、日期或截面基数验证。
+
+### 可恢复的分块下载
+
+`PartitionPlan`/`execute_partition_plan` 是生产长任务的执行接口。调用方负责按业务场景
+构造日期块、代码块或其他参数块；库负责路径预检、并发执行、原子落盘和可恢复审计。
+计划在构造时深拷贝参数并冻结配置，执行期间使用同一份完整快照。
+
+```python
+from tushare_plus import PartitionPlan
+
 chunks = [
     {"trade_date": "20260105"},
     {"trade_date": "20260106"},
 ]
 
+plan = PartitionPlan(
+    api_name="daily",
+    param_chunks=chunks,
+    output_dir="output/daily",
+    fields="ts_code,trade_date,close,vol",
+    file_format="parquet",
+    limit_per_request=5000,
+    primary_key=("ts_code", "trade_date"),
+    partition_workers=4,
+)
+
+result = client.execute_partition_plan(
+    plan,
+    resume=True,
+    continue_on_error=False,
+)
+print(result.complete, result.written, result.resumed, result.manifest_path)
+```
+
+每个数据文件都有 `<filename>.meta.json` sidecar，记录无凭据的source identity、请求指纹、
+计划指纹、行数、SHA-256和分页报告。请求指纹绑定client class、完整API URL的SHA-256
+及domain-separated认证身份哈希；展示的origin不含userinfo、path或query，token不落明文。
+轮换token会使旧checkpoint不再匹配并要求重新下载。`resume=True` 还会交叉验证脱敏参数、
+`row_count`与分页`rows_fetched`，只接受合同和哈希均匹配的checkpoint：孤立文件、
+不可解析sidecar或指纹不匹配会失败关闭；合同匹配但数据哈希损坏时会原子重拉并在
+manifest标记 `invalid_checkpoint_replaced`。使用 `resume=False` 才会显式覆盖不匹配产物。
+
+执行manifest列出所有分区的 `written`、`resumed`、`failed` 或 `not_run` 状态。
+数据、sidecar和manifest都通过同目录临时文件原子替换并严格fsync文件；支持目录fsync的
+平台还会同步目录项，不支持的平台会安全降级。output及外部manifest使用
+跨进程排他锁，冲突执行会立即失败并提示检查stale lock。token、password、secret、
+api_key等参数会从默认文件名、sidecar、manifest和错误文本中递归脱敏；敏感主键的
+首末值只记录为`***REDACTED***`，不会改变原始DataFrame或数据文件。
+
+兼容接口 `download_partitions` 仍返回路径列表，但内部使用同一执行引擎：
+
+```python
+paths = client.download_partitions(
+    "daily",
+    chunks,
+    "output/daily_csv",
+    fields="ts_code,trade_date,close,vol",
+    limit_per_request=5000,
+    primary_key=("ts_code", "trade_date"),
+    partition_workers=4,
+)
+```
+
+`iter_data` 保留为不落盘的轻量流式原语：
+
+```python
 for params, df in client.iter_data(
     "daily",
     chunks,
@@ -163,14 +263,6 @@ for params, df in client.iter_data(
     limit_per_request=5000,
 ):
     print(params, len(df))
-
-paths = client.download_partitions(
-    "daily",
-    chunks,
-    "output/daily",
-    fields="ts_code,trade_date,close,vol",
-    limit_per_request=5000,
-)
 ```
 
 ## 与官方SDK的区别
@@ -182,10 +274,14 @@ paths = client.download_partitions(
 3. 智能频率控制，避免触发API限制
 4. 自动探测各接口的限制参数
 5. 更完善的错误处理和重试机制
+6. 可审计、可恢复且失败关闭的分页与分区执行
 
 ## 已知问题
 
-当前版本存在以下已知问题，将在后续版本中改进：
+客户端只能验证服务端实际返回的页。若服务端在不产生重复键的情况下遗漏未知记录，
+客户端无法凭 `has_more` 或总行数还原缺失键；生产任务必须提供业务侧expected-key或
+截面基数合同。重复页签名采用失败关闭策略；如果两个不同offset的合法页内容完全相同，
+且调用方未提供可区分的主键，也会被保守地判为协议错误。另有以下已知问题：
 
 1. 错误代码处理不完善，当前实现的错误代码与Tushare实际的错误代码可能不一致
 

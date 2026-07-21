@@ -1,10 +1,15 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = [
+    "setuptools>=40.8,<60; python_version < '3.7'",
+    "setuptools>=64; python_version >= '3.7'",
+    "wheel<0.38; python_version < '3.7'",
+    "wheel; python_version >= '3.7'",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "tushare_plus"
-version = "0.1.8"
+version = "0.1.9"
 description = "增强版Tushare API客户端，提供自动分页、并发请求和频率限制功能"
 readme = "README.md"
 authors = [

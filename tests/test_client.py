@@ -686,7 +686,7 @@ def test_legacy_cached_zero_limit_is_redetected(tmp_path):
     assert client.redetections == 1
 
 
-def test_get_data_passes_query_scope_and_fields_to_limit_probe(tmp_path):
+def test_get_data_does_not_scope_limit_probe_to_query_params(tmp_path):
     class CaptureProbeAPI(FakePagedAPI):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -707,7 +707,7 @@ def test_get_data_passes_query_scope_and_fields_to_limit_probe(tmp_path):
     )
 
     assert frame["value"].tolist() == [0, 1]
-    assert client.probe == ("fake", {"scope": "wide"}, "value")
+    assert client.probe == ("fake", None, "value")
 
 
 def test_user_limit_satisfies_request_but_does_not_claim_source_exhaustion(tmp_path):

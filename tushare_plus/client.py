@@ -55,15 +55,17 @@ CONFIG_DIR_NAME = ".tushare_plus"
 
 
 class _RequestLimit(int):
-    """Positive execution stride with evidence about endpoint-wide reuse.
+    """Reusable request size, not a claim about the endpoint hard cap.
 
-    Exhausted/empty probes and failure fallbacks are usable for this call,
-    but must not become persistent endpoint metadata.
+    Nonempty successful probes are reusable even when that query is exhausted.
+    An optional response belongs only to the call that performed the probe;
+    caches retain the stride, never the response.
     """
 
-    def __new__(cls, value, cacheable=False):
+    def __new__(cls, value, cacheable=False, probe=None):
         instance = int.__new__(cls, value)
         instance.cacheable = cacheable
+        instance.probe = probe
         return instance
 
 
@@ -842,6 +844,7 @@ class TushareAPI:
         )
         self._api_last_call_time = {}
         self._api_info_cache = {}  # 添加缓存初始化
+        self._partition_page_sizes = {}  # Page sizing without rate detection.
         self._rate_limit_lock = threading.Lock()
         self.enable_rate_limit = enable_rate_limit  # 添加频率限制开关
 
@@ -897,7 +900,9 @@ class TushareAPI:
         return default_params
 
     def add_api_params(self, api_name, params):
-        """添加或更新API参数
+        """添加或更新接口拒绝无筛选探测时使用的备用参数。
+
+        这些参数不会自动加入实际数据查询，也不会强制缩小接口探测范围。
         
         参数:
             api_name: API接口名称
@@ -907,7 +912,7 @@ class TushareAPI:
             raise ValueError("params must be a mapping")
         self._api_required_params[api_name] = copy.deepcopy(params)
         self.logger.info(
-            f"已添加API参数: {api_name} = {_redact_sensitive(params)}"
+            f"已配置备用探测参数: {api_name} = {_redact_sensitive(params)}"
         )
 
     def _detect_api_limits(self, api_name: str) -> Tuple[int, int]:
@@ -922,7 +927,7 @@ class TushareAPI:
         required_params = self._api_required_params.get(api_name, {}).copy()
 
         # 首先探测单次请求限制
-        limit = self._detect_request_limit(api_name, required_params)
+        limit = self._detect_request_limit(api_name)
 
         # 然后探测访问频率限制
         rate_limit = self._detect_rate_limit(api_name, required_params)
@@ -940,12 +945,16 @@ class TushareAPI:
         required_params: Dict = None,
         fields: str = "",
     ) -> int:
-        """探测单次请求数据量限制
-        
-        参数:
-            api_name: API接口名称
-            required_params: 必要的请求参数
+        """探测可复用的分页大小，而非声称找到服务端硬上限。
+
+        required_params=None 时先不带业务筛选条件；仅在接口返回错误时
+        使用配置的备用参数。超时只降低请求量，不以日期等参数缩小范围。
+        显式传入的参数则保持原样，不自动替换。
         """
+        fallback_params = (
+            copy.deepcopy(self._api_required_params.get(api_name, {}))
+            if required_params is None else {}
+        )
         if required_params is None:
             required_params = {}
 
@@ -975,41 +984,30 @@ class TushareAPI:
                         params,
                         extra_secrets=[self.token],
                     )
-                    raise Exception(f"Error {result['code']}: {safe_message}")
+                    raise APIResponseError(result["code"], safe_message)
                 count, has_more = self._validate_limit_probe_data(result.get("data"))
-
-                if has_more is not None:
-                    # 如果API返回了has_more字段
-                    if not has_more:
-                        # has_more=False only proves that this particular probe
-                        # query is exhausted.  It does not prove that a wider
-                        # query to the endpoint is unlimited.  Use the observed
-                        # row count as a conservative page size instead of
-                        # caching the unsafe historical sentinel value 0.
-                        # This stride is query-local, never endpoint metadata.
-                        conservative_limit = count if count > 0 else 1
-                        self.logger.info(
-                            f"接口 {api_name} 的探测查询已取尽，采用保守分页大小 "
-                            f"{conservative_limit}"
-                        )
-                        return _RequestLimit(conservative_limit, cacheable=False)
-                    else:
-                        # has_more为True，说明有更多数据，当前返回量可能是单次限制
-                        self.logger.info(f"接口 {api_name} 的单次请求限制为 {count} 条")
-                        return _RequestLimit(count, cacheable=True)
-                else:
-                    # 如果API没有返回has_more字段，使用原来的判断逻辑
-                    # Without has_more the endpoint cap is unknowable.  The
-                    # observed positive row count is a conservative stride for
-                    # this call, not persistent endpoint metadata. Empty probes
-                    # fall back to one row to avoid guessing a large stride.
-                    conservative_limit = count if count > 0 else 1
-                    self.logger.info(
-                        f"接口 {api_name} 未返回 has_more，采用保守分页大小 "
-                        f"{conservative_limit}"
-                    )
-                    return _RequestLimit(conservative_limit, cacheable=False)
+                observed_size = self._probe_page_size(count, has_more, params.get("limit"))
+                self.logger.info(
+                    f"接口 {api_name} 探测返回 {count} 条，"
+                    f"复用分页大小 {observed_size}，has_more={has_more}"
+                )
+                return _RequestLimit(
+                    observed_size,
+                    cacheable=count > 0,
+                    probe={
+                        "api_name": api_name,
+                        "params": copy.deepcopy(params),
+                        "fields": fields,
+                        "data": result["data"],
+                        "requested_limit": params.get("limit"),
+                    },
+                )
         except Exception as e:
+            if isinstance(e, APIResponseError) and fallback_params:
+                self.logger.info(
+                    f"接口 {api_name} 拒绝无筛选探测，重试配置的备用探测参数"
+                )
+                return self._detect_request_limit(api_name, fallback_params, fields)
             safe_error = _redact_error_message(
                 e,
                 required_params,
@@ -1046,6 +1044,11 @@ class TushareAPI:
                     with self._urlopen(req) as response:
                         result = json.loads(response.read().decode("utf-8"))
                         if result["code"] != 0:
+                            if fallback_params:
+                                self.logger.info(
+                                    f"接口 {api_name} 拒绝无筛选探测，重试配置的备用探测参数"
+                                )
+                                return self._detect_request_limit(api_name, fallback_params, fields)
                             safe_message = _redact_error_message(
                                 result["msg"],
                                 params,
@@ -1058,17 +1061,24 @@ class TushareAPI:
                             result.get("data")
                         )
                         
-                        # Use the observed effective page size, not the much
-                        # larger requested probe value.  Returning limit_value
-                        # here used to make concurrent offsets skip data when a
-                        # server silently capped the response.
-                        effective_limit = count if count > 0 else 1
+                        # Only confirmed exhaustion earns growth headroom.
+                        # A capped/non-terminal response keeps its observed
+                        # stride so concurrent offsets do not skip rows.
+                        effective_limit = self._probe_page_size(count, has_more, limit_value)
                         self.logger.info(
                             f"成功使用限制值 {limit_value} 探测接口 {api_name}，"
                             f"实际返回 {count} 条，采用分页大小 {effective_limit}"
                         )
                         return _RequestLimit(
-                            effective_limit, cacheable=has_more is True
+                            effective_limit,
+                            cacheable=count > 0,
+                            probe={
+                                "api_name": api_name,
+                                "params": copy.deepcopy(required_params),
+                                "fields": fields,
+                                "data": result["data"],
+                                "requested_limit": limit_value,
+                            },
                         )
                         
                 except Exception as retry_error:
@@ -1090,6 +1100,20 @@ class TushareAPI:
                 f"所有重试尝试均失败，接口 {api_name} 使用保守分页大小 1"
             )
             return _RequestLimit(1, cacheable=False)
+
+    @staticmethod
+    def _probe_page_size(count, has_more, requested_limit=None):
+        """Reserve 25% for a growing exhausted table, within a successful bound.
+
+        This is a request target. Sequential paging still advances by observed
+        rows; concurrent paging must reject a silently capped non-final page.
+        """
+        if requested_limit is not None and count > requested_limit:
+            raise PaginationProtocolError("limit probe returned more rows than requested")
+        if count > 0 and has_more is False:
+            size = (count * 5 + 3) // 4
+            return min(size, requested_limit) if requested_limit is not None else size
+        return max(1, count)
 
     @staticmethod
     def _validate_limit_probe_data(data):
@@ -1190,8 +1214,9 @@ class TushareAPI:
     ) -> Dict:
         """获取API接口信息，如果没有则进行探测。
 
-        自动探测仅使用预定义参数。显式 probe_params 的结果仅供本次调用，
-        不写入接口缓存。取尽的小表、空响应和降级步长同样不持久化。
+        自动探测不带业务筛选，接口拒绝时才尝试备用参数。显式 probe_params 的结果仅供本次调用，
+        不写入接口缓存。非空成功探测的分页大小可复用，已取尽的小表预留25%增长余量；
+        空响应和失败降级值不持久化。缓存不代表服务端硬上限。
         
         参数:
             api_name: API接口名称
@@ -1203,8 +1228,7 @@ class TushareAPI:
             cached_size = cached_memory.get("limit_per_request", 0)
             if int(cached_size) > 0 and getattr(cached_size, "cacheable", True):
                 return cached_memory
-            # Legacy zero and query-local positive strides both need a new
-            # probe. Keep the independently measured rate available meanwhile.
+            # Legacy zero and empty/failed probe fallbacks need a new probe.
 
         # 如果禁用了频率限制，使用0表示无限制
         if not self.enable_rate_limit:
@@ -1218,13 +1242,16 @@ class TushareAPI:
                 detection_params = (
                     probe_params.copy()
                     if probe_params is not None
-                    else self._api_required_params.get(api_name, {}).copy()
+                    else None
                 )
-                limit_per_request = self._detect_request_limit(
-                    api_name,
-                    detection_params,
-                    fields=fields,
+                limit_per_request = (
+                    self._partition_page_sizes.get(api_name)
+                    if probe_params is None else None
                 )
+                if limit_per_request is None:
+                    limit_per_request = self._detect_request_limit(
+                        api_name, detection_params, fields=fields
+                    )
                 rate_limit = 0  # 使用0表示没有频率限制
                 # 保存探测结果到CSV文件
                 if probe_params is None and getattr(limit_per_request, "cacheable", True):
@@ -1244,19 +1271,25 @@ class TushareAPI:
                 detection_params = (
                     probe_params.copy()
                     if probe_params is not None
-                    else self._api_required_params.get(api_name, {}).copy()
+                    else None
                 )
-                limit_per_request = self._detect_request_limit(
-                    api_name,
-                    detection_params,
-                    fields=fields,
+                limit_per_request = (
+                    self._partition_page_sizes.get(api_name)
+                    if probe_params is None else None
                 )
-                # Reuse the independently measured rate when a small table's
-                # page stride needs re-probing; do not repeat costly bursts.
+                if limit_per_request is None:
+                    limit_per_request = self._detect_request_limit(
+                        api_name, detection_params, fields=fields
+                    )
+                # Reuse the independently measured rate on probe retries.
                 rate_limit = (
                     previous_info["rate_limit"]
                     if probe_params is None and "rate_limit" in previous_info
-                    else self._detect_rate_limit(api_name, detection_params)
+                    else self._detect_rate_limit(
+                        api_name,
+                        detection_params if detection_params is not None
+                        else self._api_required_params.get(api_name, {}).copy(),
+                    )
                 )
                 if probe_params is None and getattr(limit_per_request, "cacheable", True):
                     self.limit_detector.save_api_limits(
@@ -1280,14 +1313,20 @@ class TushareAPI:
             "rate_limit": rate_limit
         }
         if probe_params is None:
-            # Retain rate metadata, but get_api_info must re-probe a transient
-            # _RequestLimit rather than reuse it for a later wider query.
-            self._api_info_cache[api_name] = info
+            # Retain only numeric sizing/rate metadata, never query data. The
+            # fresh response remains on the return value for this caller only.
+            cached_info = dict(info)
+            cached_info["limit_per_request"] = _RequestLimit(
+                int(limit_per_request),
+                cacheable=getattr(limit_per_request, "cacheable", True),
+            )
+            self._api_info_cache[api_name] = cached_info
         return info
 
     def clear_api_limits(self, api_name: str):
         """清除指定API的限制参数（内存缓存和CSV文件）"""
         self.logger.info(f"开始清除接口 {api_name} 的限制参数...")
+        self._partition_page_sizes.pop(api_name, None)
 
         # 从CSV文件清除
         self.limit_detector.remove_api_limits(api_name)
@@ -1645,6 +1684,22 @@ class TushareAPI:
             return value, report
         return value
 
+    @staticmethod
+    def _matching_complete_probe(probe, api_name, params, fields):
+        """Reuse a fresh exhausted response for an exact query without a slice."""
+        if not probe or probe["api_name"] != api_name or probe["fields"] != fields:
+            return None
+        query = params.copy()
+        detected_query = probe["params"].copy()
+        if query.pop("offset", 0) != 0 or detected_query.pop("offset", 0) != 0:
+            return None
+        if "limit" in query or "limit" in detected_query:
+            return None
+        if _json_safe(query) != _json_safe(detected_query):
+            return None
+        data = probe["data"]
+        return data if data.get("has_more") is False else None
+
     def get_data(
         self,
         api_name,
@@ -1760,6 +1815,7 @@ class TushareAPI:
             return self._with_pagination_report(value, report, return_report)
 
         # 获取接口的单次传输限制；大表生产任务可显式传入以跳过昂贵探测。
+        fresh_probe = None
         if limit_per_request is None:
             if detect_limit:
                 api_info = self.get_api_info(
@@ -1767,6 +1823,7 @@ class TushareAPI:
                     fields=fields,
                 )
                 limit_per_request = api_info.get('limit_per_request', 5000)
+                fresh_probe = getattr(limit_per_request, "probe", None)
             else:
                 limit_per_request = 5000
 
@@ -1776,6 +1833,37 @@ class TushareAPI:
             or limit_per_request < 0
         ):
             raise ValueError("limit_per_request must be a non-negative integer")
+
+        probe_data = self._matching_complete_probe(fresh_probe, api_name, params, fields)
+        if probe_data is not None:
+            report = PaginationReport(
+                api_name=api_name,
+                mode="single_probe",
+                page_size=int(limit_per_request),
+                pages_requested=1,
+                start_offset=start_offset,
+                max_pages=max_pages,
+            )
+            page_fields, page_items, has_more = self._validate_page_payload(
+                probe_data, None, strict_paging, report
+            )
+            first_key, last_key = self._register_page_keys(
+                page_fields, page_items, normalized_key, set(), report
+            )
+            report.pages_completed = 1
+            report.rows_fetched = len(page_items)
+            report.last_has_more = has_more
+            report.source_exhausted = True
+            report.request_satisfied = True
+            report.complete = True
+            report.termination_reason = "server_exhausted"
+            self._append_page_report(
+                report, 0, fresh_probe.get("requested_limit"),
+                len(page_items), has_more, first_key, last_key
+            )
+            self.logger.info(f"复用本次已取尽的 {api_name} 探测响应，共 {len(page_items)} 条")
+            value = self._format_rows(page_fields, page_items, return_type)
+            return self._with_pagination_report(value, report, return_report)
 
         # Explicit 0 is retained for compatibility, but automatic detection no
         # longer emits it because a narrow exhausted query does not prove that
@@ -2026,7 +2114,7 @@ class TushareAPI:
                     )
                     break
 
-                # 优先使用has_more；老接口缺失该字段时，用短页判断结束。
+                # 缺失 has_more 时继续到空页；短页不能证明来源取尽。
                 if has_more is False:
                     report.source_exhausted = True
                     report.request_satisfied = True
@@ -2354,19 +2442,37 @@ class TushareAPI:
         if not plan.detect_limit:
             return 5000
 
-        # Resolve once using the endpoint profile, never the first partition's
-        # business filters. Keep this independent of rate-limit detection.
-        probe_params = self._api_required_params.get(plan.api_name, {}).copy()
+        page_size = self._partition_page_sizes.get(plan.api_name)
+        if page_size is None:
+            info = self._api_info_cache.get(plan.api_name)
+            if info is None:
+                info = self.limit_detector.get_api_limits(plan.api_name)
+            if info is not None:
+                candidate = info.get("limit_per_request", 0)
+                if int(candidate) > 0 and getattr(candidate, "cacheable", True):
+                    page_size = int(candidate)
+        if page_size is not None:
+            self._partition_page_sizes[plan.api_name] = page_size
+            return page_size
+
+        # Resolve once without the first partition's filters. The detector
+        # only uses a fallback profile if the unfiltered request is rejected.
+        # Keep this independent of rate-limit detection.
         page_size = self._detect_request_limit(
             plan.api_name,
-            probe_params,
             fields=plan.fields,
         )
         if not isinstance(page_size, int) or page_size <= 0:
             raise PaginationProtocolError(
                 "limit detection did not produce a positive page size"
             )
-        return page_size
+        if getattr(page_size, "cacheable", True):
+            self._partition_page_sizes[plan.api_name] = int(page_size)
+            # DataCube has no rate detector. Do not invent a zero/unlimited
+            # rate in Tushare's persistent cache merely to record a page size.
+            if not self.enable_rate_limit:
+                self.limit_detector.save_api_limits(plan.api_name, int(page_size), 0)
+        return int(page_size)
 
     def _source_identity(self):
         """Return a credential-free identity for the concrete API source."""

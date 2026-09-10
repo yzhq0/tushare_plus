@@ -585,7 +585,7 @@ def test_successful_pagination_report_contains_per_page_audit(tmp_path):
 
 @pytest.mark.parametrize(
     "items,has_more,expected_limit",
-    [([[1], [2], [3]], False, 3), ([], False, 1)],
+    [([[1], [2], [3]], False, 4), ([], False, 1)],
 )
 def test_limit_probe_never_treats_exhausted_query_as_unlimited(
     tmp_path,

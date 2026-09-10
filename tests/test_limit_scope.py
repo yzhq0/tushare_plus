@@ -1,4 +1,4 @@
-"""Limit discovery must not promote query cardinality to endpoint metadata."""
+"""Reusable observed strides must stay separate from query response data."""
 
 import json
 
@@ -47,27 +47,41 @@ def client(request, tmp_path):
     return request.param(**kwargs)
 
 
-@pytest.mark.parametrize("count,has_more", [(2, False), (0, False), (2, None), (0, None)])
+@pytest.mark.parametrize("has_more", [False, None, True])
 @pytest.mark.parametrize("fallback", [False, True])
-def test_small_or_empty_probe_not_cached_and_growth_is_redetected(client, count, has_more, fallback):
-    endpoint = Endpoint(count, has_more, fail_unbounded=fallback)
+def test_nonempty_probe_persists_and_is_reused_in_memory_and_from_csv(client, has_more, fallback):
+    endpoint = Endpoint(2, has_more, fail_unbounded=fallback)
     client._url_opener = endpoint
 
     first = client.get_api_info("fake", fields="value")
-    assert first["limit_per_request"] == max(1, count)
-    assert client.limit_detector.get_api_limits("fake") is None
+    expected_size = 3 if has_more is False else 2
+    assert first["limit_per_request"] == expected_size
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == expected_size
+    assert client._api_info_cache["fake"]["limit_per_request"].probe is None
 
-    # The table can grow, or the configured probe can later cover more dates.
+    # Updating the date profile must not cause another probe on each fetch.
+    client.add_api_params("fake", {"trade_date": "20260313"})
     endpoint.count, endpoint.has_more = 7, True
-    second = client.get_api_info("fake", fields="value")
-    assert second["limit_per_request"] == 7
-    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 7
     previous_calls = len(endpoint.requests)
-    assert client.get_api_info("fake")["limit_per_request"] == 7
-    assert len(endpoint.requests) == previous_calls
+    assert client.get_api_info("fake")["limit_per_request"] == expected_size
     client._api_info_cache.clear()
-    assert client.get_api_info("fake")["limit_per_request"] == 7
+    assert client.get_api_info("fake")["limit_per_request"] == expected_size
     assert len(endpoint.requests) == previous_calls
+
+    # An explicitly requested refresh can replace the conservative stride.
+    client.force_redetect_api_limits("fake")
+    assert client.get_api_info("fake")["limit_per_request"] == 7
+
+
+@pytest.mark.parametrize("has_more", [False, None])
+def test_empty_probe_is_not_persisted_and_can_recover(client, has_more):
+    endpoint = Endpoint(0, has_more)
+    client._url_opener = endpoint
+    assert client.get_api_info("fake")["limit_per_request"] == 1
+    assert client.limit_detector.get_api_limits("fake") is None
+    endpoint.count, endpoint.has_more = 7, True
+    assert client.get_api_info("fake")["limit_per_request"] == 7
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 7
 
 
 def test_query_filters_never_enter_probe_and_wider_query_keeps_full_coverage(client):
@@ -85,14 +99,14 @@ def test_query_filters_never_enter_probe_and_wider_query_keeps_full_coverage(cli
 
     client._make_request = data
     assert client.get_data("fake", fields="value", scope="narrow")["value"].tolist() == [0, 1]
-    assert endpoint.requests[0]["params"] == {"scope": "profile"}
+    assert endpoint.requests[0]["params"] == {}
     assert endpoint.requests[0]["fields"] == "value"
     assert client.get_data("fake", fields="value", scope="wide")["value"].tolist() == list(range(15))
     assert [p["limit"] for p in data_requests] == [7, 7, 7, 7]
     assert len(endpoint.requests) == 1
 
 
-def test_partition_probe_uses_profile_without_rate_probe(client, tmp_path):
+def test_partition_probe_ignores_optional_profile_without_rate_probe(client, tmp_path):
     endpoint = Endpoint(7, True)
     client._url_opener = endpoint
     client.add_api_params("fake", {"scope": "profile"})
@@ -103,7 +117,7 @@ def test_partition_probe_uses_profile_without_rate_probe(client, tmp_path):
 
     client._detect_rate_limit = forbidden
     assert client._resolve_partition_page_size(plan, {"scope": "narrow", "offset": 5, "limit": 1}) == 7
-    assert endpoint.requests[0]["params"] == {"scope": "profile"}
+    assert endpoint.requests[0]["params"] == {}
     assert endpoint.requests[0]["fields"] == "value"
 
 
@@ -140,7 +154,7 @@ def test_partition_execution_keeps_all_rows_after_narrow_first_partition(client,
     assert [part.row_count for part in result.partitions] == [2, 15]
     assert all(part.pagination_report["source_exhausted"] for part in result.partitions)
     assert len(endpoint.requests) == 1
-    assert endpoint.requests[0]["params"] == {"scope": "profile"}
+    assert endpoint.requests[0]["params"] == {}
 
 
 def test_failed_probe_fallback_is_not_cached(client, monkeypatch):
@@ -153,7 +167,18 @@ def test_failed_probe_fallback_is_not_cached(client, monkeypatch):
     assert client.limit_detector.get_api_limits("fake") is None
 
 
-def test_small_table_keeps_rate_measurement_without_reusing_stride(tmp_path):
+def test_completed_bounded_fallback_response_is_not_downloaded_again(client):
+    endpoint = Endpoint(2, False, fail_unbounded=True)
+    client._url_opener = endpoint
+    frame, report = client.get_data("fake", fields="value", return_report=True)
+    assert frame["value"].tolist() == [0, 1]
+    assert len(endpoint.requests) == 2  # Failed unbounded request + successful bounded probe.
+    assert report.mode == "single_probe"
+    assert report.pages[0]["requested_limit"] == 500000
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 3
+
+
+def test_small_table_reuses_stride_and_rate_measurement(tmp_path):
     client = TushareAPI(token="test-token", api_limits_file=str(tmp_path / "limits.csv"))
     client._url_opener = Endpoint(2, False)
     calls = []
@@ -163,19 +188,36 @@ def test_small_table_keeps_rate_measurement_without_reusing_stride(tmp_path):
         return 60
 
     client._detect_rate_limit = rate
-    assert client.get_api_info("fake")["limit_per_request"] == 2
+    assert client.get_api_info("fake")["limit_per_request"] == 3
     client._url_opener.count = 3
     assert client.get_api_info("fake")["limit_per_request"] == 3
     assert len(calls) == 1
-    assert client.limit_detector.get_api_limits("fake") is None
+    assert len(client._url_opener.requests) == 1
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 3
 
 
-def test_combined_detector_does_not_persist_small_table(tmp_path):
+def test_combined_detector_persists_small_table_stride(tmp_path):
     client = TushareAPI(token="test-token", api_limits_file=str(tmp_path / "limits.csv"))
     client._url_opener = Endpoint(2, False)
     client._detect_rate_limit = lambda *args: 60
-    assert client._detect_api_limits("fake") == (2, 60)
-    assert client.limit_detector.get_api_limits("fake") is None
+    assert client._detect_api_limits("fake") == (3, 60)
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 3
+
+
+def test_partition_sizing_reuses_small_probe_across_plans_and_honors_clear(client, tmp_path):
+    endpoint = Endpoint(2, False)
+    client._url_opener = endpoint
+    plan = PartitionPlan("fake", [{"scope": "a"}], tmp_path / "parts")
+    client.add_api_params("fake", {"scope": "profile"})
+    assert client._resolve_partition_page_size(plan, {"scope": "a"}) == 3
+    client.add_api_params("fake", {"scope": "next-profile"})
+    assert client._resolve_partition_page_size(plan, {"scope": "b"}) == 3
+    assert len(endpoint.requests) == 1
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 3
+    client.clear_api_limits("fake")
+    endpoint.count = 3
+    assert client._resolve_partition_page_size(plan, {}) == 4
+    assert len(endpoint.requests) == 2
 
 
 def test_force_redetection_repairs_only_targeted_positive_cache(client):

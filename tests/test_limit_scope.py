@@ -99,14 +99,14 @@ def test_query_filters_never_enter_probe_and_wider_query_keeps_full_coverage(cli
 
     client._make_request = data
     assert client.get_data("fake", fields="value", scope="narrow")["value"].tolist() == [0, 1]
-    assert endpoint.requests[0]["params"] == {}
+    assert endpoint.requests[0]["params"] == {"scope": "profile"}
     assert endpoint.requests[0]["fields"] == "value"
     assert client.get_data("fake", fields="value", scope="wide")["value"].tolist() == list(range(15))
     assert [p["limit"] for p in data_requests] == [7, 7, 7, 7]
     assert len(endpoint.requests) == 1
 
 
-def test_partition_probe_ignores_optional_profile_without_rate_probe(client, tmp_path):
+def test_partition_probe_uses_required_profile_without_rate_probe(client, tmp_path):
     endpoint = Endpoint(7, True)
     client._url_opener = endpoint
     client.add_api_params("fake", {"scope": "profile"})
@@ -117,7 +117,7 @@ def test_partition_probe_ignores_optional_profile_without_rate_probe(client, tmp
 
     client._detect_rate_limit = forbidden
     assert client._resolve_partition_page_size(plan, {"scope": "narrow", "offset": 5, "limit": 1}) == 7
-    assert endpoint.requests[0]["params"] == {}
+    assert endpoint.requests[0]["params"] == {"scope": "profile"}
     assert endpoint.requests[0]["fields"] == "value"
 
 
@@ -154,7 +154,7 @@ def test_partition_execution_keeps_all_rows_after_narrow_first_partition(client,
     assert [part.row_count for part in result.partitions] == [2, 15]
     assert all(part.pagination_report["source_exhausted"] for part in result.partitions)
     assert len(endpoint.requests) == 1
-    assert endpoint.requests[0]["params"] == {}
+    assert endpoint.requests[0]["params"] == {"scope": "profile"}
 
 
 def test_failed_probe_fallback_is_not_cached(client, monkeypatch):

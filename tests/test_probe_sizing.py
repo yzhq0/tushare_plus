@@ -1,4 +1,4 @@
-"""Optional date profiles must not shrink endpoint-wide limit discovery."""
+"""Probe sizing preserves timeout backoff, cache reuse, and growth headroom."""
 
 import json
 
@@ -50,7 +50,7 @@ def test_timeout_retries_reduce_limit_without_adding_optional_date(tmp_path, mon
     limits = str(tmp_path / "limits.csv")
     client = DataCubeAPI(token="test-token", api_limits_file=limits)
     client._url_opener = server
-    client.add_api_params("daily", {"trade_date": "20260312"})
+    # The caller does not configure a required date for this endpoint.
     if entry == "partition":
         plan = PartitionPlan("daily", [{"trade_date": "20260312"}], tmp_path / "parts")
         assert client._resolve_partition_page_size(plan, {"trade_date": "20260312"}) == 200000
@@ -59,7 +59,6 @@ def test_timeout_retries_reduce_limit_without_adding_optional_date(tmp_path, mon
 
     assert server.requests[:3] == [{}, {"limit": 500000}, {"limit": 200000}]
     assert client.limit_detector.get_api_limits("daily")["limit_per_request"] == 200000
-    client.add_api_params("daily", {"trade_date": "20260313"})
     previous_calls = len(server.requests)
     assert len(client.get_data("daily", trade_date="20260313")) == 5481
     assert len(server.requests) == previous_calls + 1

@@ -667,7 +667,7 @@ def test_concurrent_short_non_final_page_is_rejected(tmp_path):
         )
 
 
-def test_legacy_cached_zero_limit_is_redetected(tmp_path):
+def test_explicit_probe_bypasses_but_does_not_replace_cached_unlimited(tmp_path):
     class RedetectAPI(FakePagedAPI):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -683,6 +683,9 @@ def test_legacy_cached_zero_limit_is_redetected(tmp_path):
     info = client.get_api_info("fake", probe_params={"scope": "wide"}, fields="value")
 
     assert info["limit_per_request"] == 2
+    assert client.redetections == 1
+    assert client.limit_detector.get_api_limits("fake")["limit_per_request"] == 0
+    assert client.get_api_info("fake")["limit_per_request"] == 0
     assert client.redetections == 1
 
 

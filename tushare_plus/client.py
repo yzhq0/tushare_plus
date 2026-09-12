@@ -900,9 +900,9 @@ class TushareAPI:
         return default_params
 
     def add_api_params(self, api_name, params):
-        """添加或更新接口拒绝无筛选探测时使用的备用参数。
+        """添加或更新接口探测所需的参数。
 
-        这些参数不会自动加入实际数据查询，也不会强制缩小接口探测范围。
+        首次探测及其重试都使用这些参数；它们不会自动加入实际数据查询。
         
         参数:
             api_name: API接口名称
@@ -912,7 +912,7 @@ class TushareAPI:
             raise ValueError("params must be a mapping")
         self._api_required_params[api_name] = copy.deepcopy(params)
         self.logger.info(
-            f"已配置备用探测参数: {api_name} = {_redact_sensitive(params)}"
+            f"已添加API参数: {api_name} = {_redact_sensitive(params)}"
         )
 
     def _detect_api_limits(self, api_name: str) -> Tuple[int, int]:
@@ -927,7 +927,7 @@ class TushareAPI:
         required_params = self._api_required_params.get(api_name, {}).copy()
 
         # 首先探测单次请求限制
-        limit = self._detect_request_limit(api_name)
+        limit = self._detect_request_limit(api_name, required_params)
 
         # 然后探测访问频率限制
         rate_limit = self._detect_rate_limit(api_name, required_params)
@@ -947,14 +947,9 @@ class TushareAPI:
     ) -> int:
         """探测可复用的分页大小，而非声称找到服务端硬上限。
 
-        required_params=None 时先不带业务筛选条件；仅在接口返回错误时
-        使用配置的备用参数。超时只降低请求量，不以日期等参数缩小范围。
-        显式传入的参数则保持原样，不自动替换。
+        首次请求及超时降档都保留调用者传入的 required_params。
+        自动调用路径传入接口配置，不混入当前查询或首个分区的筛选条件。
         """
-        fallback_params = (
-            copy.deepcopy(self._api_required_params.get(api_name, {}))
-            if required_params is None else {}
-        )
         if required_params is None:
             required_params = {}
 
@@ -1003,11 +998,6 @@ class TushareAPI:
                     },
                 )
         except Exception as e:
-            if isinstance(e, APIResponseError) and fallback_params:
-                self.logger.info(
-                    f"接口 {api_name} 拒绝无筛选探测，重试配置的备用探测参数"
-                )
-                return self._detect_request_limit(api_name, fallback_params, fields)
             safe_error = _redact_error_message(
                 e,
                 required_params,
@@ -1044,11 +1034,6 @@ class TushareAPI:
                     with self._urlopen(req) as response:
                         result = json.loads(response.read().decode("utf-8"))
                         if result["code"] != 0:
-                            if fallback_params:
-                                self.logger.info(
-                                    f"接口 {api_name} 拒绝无筛选探测，重试配置的备用探测参数"
-                                )
-                                return self._detect_request_limit(api_name, fallback_params, fields)
                             safe_message = _redact_error_message(
                                 result["msg"],
                                 params,
@@ -1214,9 +1199,9 @@ class TushareAPI:
     ) -> Dict:
         """获取API接口信息，如果没有则进行探测。
 
-        自动探测不带业务筛选，接口拒绝时才尝试备用参数。显式 probe_params 的结果仅供本次调用，
+        自动探测始终携带已配置的必要参数。显式 probe_params 的结果仅供本次调用，
         不写入接口缓存。非空成功探测的分页大小可复用，已取尽的小表预留25%增长余量；
-        空响应和失败降级值不持久化。缓存不代表服务端硬上限。
+        空响应和失败降级值不持久化。缓存中的 0 表示无限制，不触发重探测。
         
         参数:
             api_name: API接口名称
@@ -1225,10 +1210,11 @@ class TushareAPI:
         previous_info = self._api_info_cache.get(api_name, {})
         if probe_params is None and api_name in self._api_info_cache:
             cached_memory = self._api_info_cache[api_name]
-            cached_size = cached_memory.get("limit_per_request", 0)
-            if int(cached_size) > 0 and getattr(cached_size, "cacheable", True):
+            cached_size = cached_memory.get("limit_per_request")
+            if cached_size is not None and int(cached_size) >= 0 and getattr(cached_size, "cacheable", True):
                 return cached_memory
-            # Legacy zero and empty/failed probe fallbacks need a new probe.
+            # Missing/invalid metadata and empty/failed fallbacks need a probe;
+            # an explicit cached zero means unlimited, not unknown.
 
         # 如果禁用了频率限制，使用0表示无限制
         if not self.enable_rate_limit:
@@ -1237,12 +1223,12 @@ class TushareAPI:
                 self.limit_detector.get_api_limits(api_name)
                 if probe_params is None else None
             )
-            if cached_limits is None or int(cached_limits["limit_per_request"]) <= 0:
+            if cached_limits is None or int(cached_limits["limit_per_request"]) < 0:
                 # 没有缓存，只探测单次请求限制
                 detection_params = (
                     probe_params.copy()
                     if probe_params is not None
-                    else None
+                    else self._api_required_params.get(api_name, {}).copy()
                 )
                 limit_per_request = (
                     self._partition_page_sizes.get(api_name)
@@ -1266,12 +1252,12 @@ class TushareAPI:
                 if probe_params is None else None
             )
 
-            if cached_limits is None or int(cached_limits["limit_per_request"]) <= 0:
+            if cached_limits is None or int(cached_limits["limit_per_request"]) < 0:
                 # 没有缓存，进行探测
                 detection_params = (
                     probe_params.copy()
                     if probe_params is not None
-                    else None
+                    else self._api_required_params.get(api_name, {}).copy()
                 )
                 limit_per_request = (
                     self._partition_page_sizes.get(api_name)
@@ -1285,11 +1271,7 @@ class TushareAPI:
                 rate_limit = (
                     previous_info["rate_limit"]
                     if probe_params is None and "rate_limit" in previous_info
-                    else self._detect_rate_limit(
-                        api_name,
-                        detection_params if detection_params is not None
-                        else self._api_required_params.get(api_name, {}).copy(),
-                    )
+                    else self._detect_rate_limit(api_name, detection_params)
                 )
                 if probe_params is None and getattr(limit_per_request, "cacheable", True):
                     self.limit_detector.save_api_limits(
@@ -1865,9 +1847,9 @@ class TushareAPI:
             value = self._format_rows(page_fields, page_items, return_type)
             return self._with_pagination_report(value, report, return_report)
 
-        # Explicit 0 is retained for compatibility, but automatic detection no
-        # longer emits it because a narrow exhausted query does not prove that
-        # an endpoint is unlimited.
+        # Explicit or cached 0 means unlimited: issue one request without adding
+        # a page limit. Automatic probes still reserve growth headroom rather
+        # than interpreting one exhausted query as an unlimited endpoint.
         if limit_per_request == 0:
             report = PaginationReport(
                 api_name=api_name,
@@ -2444,27 +2426,28 @@ class TushareAPI:
 
         page_size = self._partition_page_sizes.get(plan.api_name)
         if page_size is None:
-            info = self._api_info_cache.get(plan.api_name)
-            if info is None:
-                info = self.limit_detector.get_api_limits(plan.api_name)
-            if info is not None:
-                candidate = info.get("limit_per_request", 0)
-                if int(candidate) > 0 and getattr(candidate, "cacheable", True):
-                    page_size = int(candidate)
+            for get_info in (self._api_info_cache.get, self.limit_detector.get_api_limits):
+                info = get_info(plan.api_name)
+                if info is not None:
+                    candidate = info.get("limit_per_request")
+                    if candidate is not None and int(candidate) >= 0 and getattr(candidate, "cacheable", True):
+                        page_size = int(candidate)
+                        break
         if page_size is not None:
             self._partition_page_sizes[plan.api_name] = page_size
             return page_size
 
-        # Resolve once without the first partition's filters. The detector
-        # only uses a fallback profile if the unfiltered request is rejected.
-        # Keep this independent of rate-limit detection.
+        # Resolve once using the configured required params, never the first
+        # partition's filters. Keep this independent of rate-limit detection.
+        required_params = self._api_required_params.get(plan.api_name, {}).copy()
         page_size = self._detect_request_limit(
             plan.api_name,
+            required_params,
             fields=plan.fields,
         )
-        if not isinstance(page_size, int) or page_size <= 0:
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 0:
             raise PaginationProtocolError(
-                "limit detection did not produce a positive page size"
+                "limit detection did not produce a non-negative page size"
             )
         if getattr(page_size, "cacheable", True):
             self._partition_page_sizes[plan.api_name] = int(page_size)

@@ -1,4 +1,4 @@
-"""Regression coverage for fresh response reuse and required-parameter fallback."""
+"""Regression coverage for fresh response reuse with required probe parameters."""
 
 import json
 
@@ -75,14 +75,14 @@ def test_date_loop_probes_once_per_api_and_reuses_matching_initial_response(tmp_
                 assert report.pages[0]["requested_limit"] is None
 
     probes = [p for p in server.requests if "limit" not in p["params"]]
-    assert len(probes) == 4  # One rejection + one successful probe per API, not per day.
-    assert len(server.requests) == (6 if bounded_metadata else 8)
+    assert len(probes) == 2  # One successful probe per API, with required params from the start.
+    assert len(server.requests) == (4 if bounded_metadata else 6)
     for api in ("dated_prices", "dated_basics"):
         assert client._api_info_cache[api]["limit_per_request"] == 6853
         assert client.limit_detector.get_api_limits(api)["limit_per_request"] == 6853
 
 
-@pytest.mark.parametrize("new_count,expected_calls", [(5500, 3), (7000, 4)])
+@pytest.mark.parametrize("new_count,expected_calls", [(5500, 2), (7000, 3)])
 def test_new_client_reads_csv_and_newer_larger_data_is_not_truncated(tmp_path, new_count, expected_calls):
     server = DateRequiredServer()
     client = make_client(tmp_path, server)
@@ -94,7 +94,7 @@ def test_new_client_reads_csv_and_newer_larger_data_is_not_truncated(tmp_path, n
     frame = newer_client.get_data("daily", trade_date="20260313")
     assert frame["value"].tolist() == list(range(new_count))
     assert len(server.requests) == expected_calls  # Growth within headroom needs only one data page.
-    assert all("limit" in p["params"] for p in server.requests[2:])
+    assert all("limit" in p["params"] for p in server.requests[1:])
 
 
 def test_repeat_identical_query_fetches_fresh_data_instead_of_cached_response(tmp_path):
@@ -105,7 +105,7 @@ def test_repeat_identical_query_fetches_fresh_data_instead_of_cached_response(tm
     assert len(client.get_data("daily", trade_date="20260312")) == 2
     server.counts["20260312"] = 3
     assert len(client.get_data("daily", trade_date="20260312")) == 3
-    assert len(server.requests) == 3
+    assert len(server.requests) == 2
 
 
 @pytest.mark.parametrize("params", [
@@ -133,7 +133,7 @@ def test_cached_probe_does_not_supply_different_fields(tmp_path):
     client.get_api_info("daily", fields="value")
     frame = client.get_data("daily", trade_date="20260312", fields="trade_date")
     assert frame.columns.tolist() == ["trade_date"]
-    assert len(server.requests) == 3
+    assert len(server.requests) == 2
     assert server.requests[-1]["fields"] == "trade_date"
 
 

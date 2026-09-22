@@ -731,6 +731,181 @@ def test_user_limit_satisfies_request_but_does_not_claim_source_exhaustion(tmp_p
     assert report.termination_reason == "user_limit"
 
 
+def test_sequential_paging_accepts_an_enlarged_final_page(tmp_path):
+    class EnlargedFinalPageAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            offset = int(params.get("offset", 0))
+            if offset == 0:
+                return {
+                    "fields": ["value"],
+                    "items": [[0], [1]],
+                    "has_more": True,
+                }
+            return {
+                "fields": ["value"],
+                "items": [[2], [3], [4]],
+                "has_more": False,
+            }
+
+    client = EnlargedFinalPageAPI(tmp_path)
+    frame, report = client.get_data(
+        "fake", limit_per_request=2, return_report=True
+    )
+
+    assert frame["value"].tolist() == [0, 1, 2, 3, 4]
+    assert [page["row_count"] for page in report.pages] == [2, 3]
+    assert report.pages[1]["server_row_count"] == 3
+    assert report.source_exhausted is True
+    assert report.termination_reason == "server_exhausted"
+
+    limited_frame, limited_report = client.get_data(
+        "fake", limit=1, limit_per_request=2, return_report=True
+    )
+    assert limited_frame["value"].tolist() == [0]
+    assert limited_report.pages[0]["row_count"] == 1
+    assert limited_report.pages[0]["server_row_count"] == 2
+    assert limited_report.termination_reason == "user_limit"
+
+
+def test_sequential_paging_deduplicates_boundary_rows_without_skipping(tmp_path):
+    class BoundaryOverlapAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            offset = int(params.get("offset", 0))
+            if offset == 0:
+                return {
+                    "fields": ["value"],
+                    "items": [[0], [1]],
+                    "has_more": True,
+                }
+            if offset == 2:
+                return {
+                    "fields": ["value"],
+                    "items": [[1], [2], [3]],
+                    "has_more": True,
+                }
+            assert offset == 5
+            return {
+                "fields": ["value"],
+                "items": [[4]],
+                "has_more": False,
+            }
+
+    client = BoundaryOverlapAPI(tmp_path)
+    frame, report = client.get_data(
+        "fake", limit_per_request=2, return_report=True
+    )
+
+    assert frame["value"].tolist() == [0, 1, 2, 3, 4]
+    assert report.duplicate_row_count == 1
+    assert report.pages[1]["duplicate_row_count"] == 1
+    assert report.pages[1]["server_row_count"] == 3
+
+
+def test_sequential_paging_deduplicates_before_capping_user_limit(tmp_path):
+    class LimitedBoundaryOverlapAPI(FakePagedAPI):
+        def __init__(self, path):
+            super().__init__(path)
+            self.requests = []
+
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            offset = int(params.get("offset", 0))
+            self.requests.append((offset, int(params["limit"])))
+            if offset == 0:
+                return {
+                    "fields": ["value"],
+                    "items": [[0], [1]],
+                    "has_more": True,
+                }
+            assert offset == 2
+            return {
+                "fields": ["value"],
+                "items": [[1], [2]],
+                "has_more": True,
+            }
+
+    client = LimitedBoundaryOverlapAPI(tmp_path)
+    frame, report = client.get_data(
+        "fake", limit=3, limit_per_request=2, return_report=True
+    )
+
+    assert frame["value"].tolist() == [0, 1, 2]
+    assert client.requests == [(0, 2), (2, 1)]
+    assert report.rows_fetched == 3
+    assert report.duplicate_row_count == 1
+    assert report.pages[1]["row_count"] == 1
+    assert report.pages[1]["server_row_count"] == 2
+    assert report.pages[1]["duplicate_row_count"] == 1
+    assert report.termination_reason == "user_limit"
+
+
+def test_sequential_paging_preserves_non_boundary_and_same_page_duplicates(tmp_path):
+    class LegitimateDuplicateAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            offset = int(params.get("offset", 0))
+            if offset == 0:
+                return {
+                    "fields": ["value"],
+                    "items": [[0], [0], [1]],
+                    "has_more": True,
+                }
+            assert offset == 3
+            return {
+                "fields": ["value"],
+                "items": [[2], [0], [3]],
+                "has_more": False,
+            }
+
+    client = LegitimateDuplicateAPI(tmp_path)
+    frame, report = client.get_data(
+        "fake", limit_per_request=2, return_report=True
+    )
+
+    assert frame["value"].tolist() == [0, 0, 1, 2, 0, 3]
+    assert report.rows_fetched == 6
+    assert report.duplicate_row_count == 0
+
+
+def test_sequential_paging_preserves_boundary_duplicate_without_overflow(tmp_path):
+    class LegitimateBoundaryDuplicateAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            offset = int(params.get("offset", 0))
+            if offset == 0:
+                return {
+                    "fields": ["value"],
+                    "items": [[0], [1]],
+                    "has_more": True,
+                }
+            assert offset == 2
+            return {
+                "fields": ["value"],
+                "items": [[1], [2]],
+                "has_more": False,
+            }
+
+    client = LegitimateBoundaryDuplicateAPI(tmp_path)
+    frame, report = client.get_data(
+        "fake", limit_per_request=2, return_report=True
+    )
+
+    assert frame["value"].tolist() == [0, 1, 1, 2]
+    assert report.rows_fetched == 4
+    assert report.duplicate_row_count == 0
+
+
+def test_sequential_paging_rejects_more_than_one_extra_row(tmp_path):
+    class ExcessiveOverflowAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            return {
+                "fields": ["value"],
+                "items": [[0], [1], [2], [3]],
+                "has_more": False,
+            }
+
+    client = ExcessiveOverflowAPI(tmp_path)
+    with pytest.raises(PaginationProtocolError, match="more than one extra row"):
+        client.get_data("fake", limit_per_request=2)
+
+
 def test_explicit_unbounded_request_without_has_more_fails_closed(tmp_path):
     class NoHasMoreAPI(FakePagedAPI):
         def _make_request(self, api_name, params, fields, retry_count=0):
@@ -1443,7 +1618,7 @@ def test_repeated_page_at_new_offset_fails_instead_of_making_progress(
 
 @pytest.mark.parametrize(
     "items,has_more,limit",
-    [([[1]], True, 2), ([[1], [2], [3]], False, 2)],
+    [([[1]], True, 2)],
 )
 def test_single_request_explicit_limit_contradictions_fail_closed(
     tmp_path, items, has_more, limit
@@ -1461,6 +1636,44 @@ def test_single_request_explicit_limit_contradictions_fail_closed(
     assert report.complete is False
     assert report.source_exhausted is False
     assert report.exhaustion_inferred is False
+
+
+def test_single_request_explicit_limit_caps_server_overflow(tmp_path):
+    class OverflowingSingleAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            return {
+                "fields": ["value"],
+                "items": [[1], [2], [3]],
+                "has_more": False,
+            }
+
+    client = OverflowingSingleAPI(tmp_path)
+    frame, report = client.get_data(
+        "fake", auto_paging=False, limit=2, return_report=True
+    )
+
+    assert frame["value"].tolist() == [1, 2]
+    assert report.rows_fetched == 2
+    assert report.pages[0]["server_row_count"] == 3
+
+    raw = client.get_data(
+        "fake", auto_paging=False, limit=2, return_type="raw"
+    )
+    assert raw == {"fields": ["value"], "items": [[1], [2]], "has_more": False}
+
+
+def test_single_request_rejects_more_than_one_extra_row(tmp_path):
+    class ExcessiveOverflowSingleAPI(FakePagedAPI):
+        def _make_request(self, api_name, params, fields, retry_count=0):
+            return {
+                "fields": ["value"],
+                "items": [[1], [2], [3], [4]],
+                "has_more": False,
+            }
+
+    client = ExcessiveOverflowSingleAPI(tmp_path)
+    with pytest.raises(PaginationProtocolError, match="more than one extra row"):
+        client.get_data("fake", auto_paging=False, limit=2)
 
 
 def test_limit_probe_rejects_malformed_and_empty_has_more_payloads(

@@ -125,6 +125,7 @@ class PaginationReport:
         user_limit=None,
         max_pages=None,
         duplicate_key_count=0,
+        duplicate_row_count=0,
         pages=None,
         request_satisfied=False,
         source_exhausted=False,
@@ -143,6 +144,7 @@ class PaginationReport:
         self.user_limit = user_limit
         self.max_pages = max_pages
         self.duplicate_key_count = duplicate_key_count
+        self.duplicate_row_count = duplicate_row_count
         self.pages = list(pages or [])
         self.request_satisfied = request_satisfied
         self.source_exhausted = source_exhausted
@@ -163,6 +165,7 @@ class PaginationReport:
             "user_limit": self.user_limit,
             "max_pages": self.max_pages,
             "duplicate_key_count": self.duplicate_key_count,
+            "duplicate_row_count": self.duplicate_row_count,
             "pages": [dict(page) for page in self.pages],
             "request_satisfied": self.request_satisfied,
             "source_exhausted": self.source_exhausted,
@@ -1551,6 +1554,35 @@ class TushareAPI:
         ).encode("utf-8")
         return hashlib.sha256(serialized).hexdigest()
 
+    @staticmethod
+    def _row_content_signature(row):
+        """Fingerprint a complete row for safe cross-page de-duplication."""
+        serialized = json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        ).encode("utf-8")
+        return hashlib.sha256(serialized).hexdigest()
+
+    def _drop_overflow_boundary_duplicate(
+        self,
+        items,
+        requested_limit,
+        previous_page_last_signature,
+    ):
+        """Drop the boundary row only for the known one-row overflow defect."""
+        if (
+            not items
+            or len(items) != requested_limit + 1
+            or previous_page_last_signature is None
+            or self._row_content_signature(items[0])
+            != previous_page_last_signature
+        ):
+            return items, 0
+        return items[1:], 1
+
     def _validate_page_payload(
         self,
         data,
@@ -1648,6 +1680,8 @@ class TushareAPI:
         has_more,
         first_key=None,
         last_key=None,
+        server_row_count=None,
+        duplicate_row_count=0,
     ):
         page = {
             "offset": offset,
@@ -1658,6 +1692,16 @@ class TushareAPI:
         if first_key is not None:
             page["first_key"] = list(first_key)
             page["last_key"] = list(last_key)
+        if server_row_count is not None and (
+            server_row_count != row_count
+            or (
+                requested_limit is not None
+                and server_row_count > requested_limit
+            )
+        ):
+            page["server_row_count"] = server_row_count
+        if duplicate_row_count:
+            page["duplicate_row_count"] = duplicate_row_count
         report.pages.append(page)
 
     @staticmethod
@@ -1710,7 +1754,7 @@ class TushareAPI:
             detect_limit: 是否自动探测单次请求限制；为False且未指定limit_per_request时使用5000
             return_type: 返回类型，支持 pandas、polars、arrow、raw；默认pandas
             primary_key: 可选主键字段；提供后跨页重复键会失败
-            strict_paging: 是否对分页协议矛盾和未完整终止失败关闭
+            strict_paging: 是否对无法安全处理的分页协议矛盾和未完整终止失败关闭
             return_report: 为True时返回 ``(data, PaginationReport)``
             **params: API的其他参数
         
@@ -1750,6 +1794,18 @@ class TushareAPI:
                 strict_paging,
                 report,
             )
+            server_row_count = len(page_items)
+            if (
+                strict_paging
+                and user_limit is not None
+                and server_row_count > user_limit + 1
+            ):
+                raise PaginationProtocolError(
+                    "server returned more than one extra row",
+                    report,
+                )
+            if user_limit is not None and server_row_count > user_limit:
+                page_items = page_items[:user_limit]
             first_key, last_key = self._register_page_keys(
                 page_fields,
                 page_items,
@@ -1774,13 +1830,12 @@ class TushareAPI:
                 has_more,
                 first_key,
                 last_key,
+                server_row_count,
             )
             explicit_limit_contradiction = (
                 user_limit is not None
-                and (
-                    len(page_items) > user_limit
-                    or (len(page_items) < user_limit and has_more is True)
-                )
+                and len(page_items) < user_limit
+                and has_more is True
             )
             if explicit_limit_contradiction:
                 report.request_satisfied = False
@@ -1793,7 +1848,11 @@ class TushareAPI:
                         "single request response contradicts its explicit limit",
                         report,
                     )
-            value = self._format_response_data(data, return_type)
+            if return_type == "raw":
+                value = dict(data)
+                value["items"] = page_items
+            else:
+                value = self._format_rows(page_fields, page_items, return_type)
             return self._with_pagination_report(value, report, return_report)
 
         # 获取接口的单次传输限制；大表生产任务可显式传入以跳过昂贵探测。
@@ -1970,6 +2029,7 @@ class TushareAPI:
             total_fetched = 0
             offset = start_offset
             seen_keys = set()
+            previous_page_last_signature = None
             seen_page_signatures = {}
             report = PaginationReport(
                 api_name=api_name,
@@ -2017,24 +2077,53 @@ class TushareAPI:
                 )
                 if fields_list is None:
                     fields_list = page_fields
-                current_count = len(page_items)
-                if strict_paging and current_count > page_params["limit"]:
+                server_page_items = page_items
+                server_row_count = len(server_page_items)
+                server_page_last_signature = (
+                    self._row_content_signature(server_page_items[-1])
+                    if server_page_items
+                    else None
+                )
+                # Some offset APIs return an enlarged final page even when an
+                # automatically generated page limit was requested.
+                # Sequential paging can handle that safely because the next
+                # offset is based on the observed row count below.  When the
+                # first row repeats the preceding page boundary, remove that
+                # row before applying the caller's total limit.  Otherwise a
+                # duplicate could consume the remaining limit and make a new
+                # row from the same server response disappear.  Concurrent
+                # paging keeps the stricter overflow check because its offsets
+                # were planned before responses arrived.
+                if (
+                    strict_paging
+                    and server_row_count > page_params["limit"] + 1
+                ):
                     raise PaginationProtocolError(
-                        "server returned more rows than requested",
+                        "server returned more than one extra row",
                         report,
                     )
+                page_items, duplicate_row_count = self._drop_overflow_boundary_duplicate(
+                    server_page_items,
+                    page_params["limit"],
+                    previous_page_last_signature,
+                )
+                if user_limit is not None:
+                    remaining = user_limit - total_fetched
+                    if len(page_items) > remaining:
+                        page_items = page_items[:remaining]
+                returned_row_count = len(page_items)
                 request_will_continue = (
-                    current_count > 0
+                    server_row_count > 0
                     and has_more is not False
                     and not (
                         user_limit is not None
-                        and total_fetched + current_count >= user_limit
+                        and total_fetched + returned_row_count >= user_limit
                     )
                 )
                 if request_will_continue:
                     page_signature = self._page_content_signature(
                         page_fields,
-                        page_items,
+                        server_page_items,
                     )
                     previous_offset = seen_page_signatures.get(page_signature)
                     if previous_offset is not None and previous_offset != offset:
@@ -2047,7 +2136,7 @@ class TushareAPI:
                             report,
                             offset,
                             page_params["limit"],
-                            current_count,
+                            returned_row_count,
                             has_more,
                         )
                         raise PaginationProtocolError(
@@ -2055,15 +2144,20 @@ class TushareAPI:
                             report,
                         )
                     seen_page_signatures[page_signature] = offset
+                # Register the original server rows so primary_key retains its
+                # fail-closed contract even when automatic boundary de-duplication
+                # would otherwise remove the repeated row from the result.
                 first_key, last_key = self._register_page_keys(
                     page_fields,
-                    page_items,
+                    server_page_items,
                     normalized_key,
                     seen_keys,
                     report,
                 )
+                current_count = len(page_items)
                 report.pages_completed += 1
                 report.rows_fetched += current_count
+                report.duplicate_row_count += duplicate_row_count
                 report.last_has_more = has_more
                 self._append_page_report(
                     report,
@@ -2073,13 +2167,15 @@ class TushareAPI:
                     has_more,
                     first_key,
                     last_key,
+                    server_row_count,
+                    duplicate_row_count,
                 )
 
                 # 添加到结果集
                 all_data.extend(page_items)
                 total_fetched += current_count
 
-                if current_count == 0:
+                if server_row_count == 0:
                     if strict_paging and has_more is True:
                         raise PaginationProtocolError(
                             "empty page returned with has_more=True",
@@ -2105,7 +2201,8 @@ class TushareAPI:
                     break
 
                 # 更新offset，准备获取下一页
-                offset += current_count
+                offset += server_row_count
+                previous_page_last_signature = server_page_last_signature
 
                 # 如果用户指定了limit并且已经达到，停止获取
                 if user_limit is not None and total_fetched >= user_limit:
